@@ -39,7 +39,7 @@ mail:
   send_delay_seconds: 0.3
   validate_domain: true
   allowed_domains:
-    - "domain.ru"
+    - "roskapstroy.com"
 
 report:
   title: "Контроль отправки уведомлений о тестировании"
