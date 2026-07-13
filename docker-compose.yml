@@ -1,6 +1,7 @@
 services:
   invite-mailer:
     build: .
+    pull_policy: build
     container_name: invite-mailer
     restart: unless-stopped
     environment:
