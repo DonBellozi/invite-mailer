@@ -1,0 +1,59 @@
+app:
+  timezone: "Europe/Moscow"
+  database_path: "/opt/invite-mailer/state/invite_mailer.sqlite"
+  reports_path: "/opt/invite-mailer/reports"
+  data_path: "/opt/invite-mailer/data"
+
+schedule:
+  # Ежедневно забираем свежий XLSX после обработки другой системой.
+  fetch_hour: 8
+  fetch_minute: 30
+
+  # Основная рассылка раз в неделю.
+  send_day_of_week: "sun"
+  send_hour: 9
+  send_minute: 0
+
+source:
+  attachment_filename: "Штатные сотрудники - Телефонный справочник2 (XLSX).xlsx"
+  sheet_name: null
+  min_employees: 1
+  max_drop_percent: 35
+  absence_grace_imports: 1
+
+xlsx:
+  header_search_rows: 20
+  columns:
+    snils: "СНИЛС"
+    fio: "Сотрудник.Физическое лицо.ФИО"
+    email: "Физическое лицо.Адрес электронной почты"
+    position: "Должность"
+
+identity:
+  login_source: "email_localpart"
+  lowercase: true
+  # Резервный YAML-файл. Значения LOGIN_OVERRIDES_JSON из Portainer имеют приоритет.
+  overrides_file: "/opt/invite-mailer/config/login_overrides.yaml"
+
+mail:
+  send_delay_seconds: 0.3
+  validate_domain: true
+  allowed_domains:
+    - "domain.ru"
+
+report:
+  title: "Контроль отправки уведомлений о тестировании"
+
+alerts:
+  enabled: false
+  recipients: []
+
+# Модуль INDIGO пока отключен. При enabled=false подключение к PostgreSQL не выполняется.
+indigo:
+  enabled: false
+  host: ""
+  port: 5432
+  database: ""
+  username: ""
+  password: ""
+  view: "res.results_view"

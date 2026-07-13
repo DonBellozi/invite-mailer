@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from openpyxl import load_workbook
+
+
+SNILS_RE = re.compile(r"^\d{3}-?\d{3}-?\d{3}\s?\d{2}$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+@dataclass
+class EmployeeRecord:
+    worker_key: str
+    fio: str
+    email: str | None
+    login: str | None
+    department: str | None
+    position: str | None
+
+
+def normalize_header(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).replace("\n", " ").split()).strip().lower()
+
+
+def normalize_snils(value: Any) -> str | None:
+    if value is None:
+        return None
+    digits = re.sub(r"\D", "", str(value))
+    return digits if len(digits) == 11 else None
+
+
+def worker_key(snils: str, secret: str) -> str:
+    return hmac.new(secret.encode(), snils.encode(), hashlib.sha256).hexdigest()
+
+
+def normalize_email(value: Any) -> str | None:
+    if value is None:
+        return None
+    email = str(value).strip().lower()
+    return email if EMAIL_RE.match(email) else None
+
+
+def find_header_row(sheet, expected: dict[str, str], search_rows: int) -> tuple[int, dict[str, int]]:
+    normalized_expected = {key: normalize_header(name) for key, name in expected.items()}
+
+    best_row = None
+    best_mapping: dict[str, int] = {}
+    for row_idx in range(1, min(search_rows, sheet.max_row) + 1):
+        values = [normalize_header(sheet.cell(row=row_idx, column=col).value) for col in range(1, sheet.max_column + 1)]
+        mapping: dict[str, int] = {}
+        for key, target in normalized_expected.items():
+            for col_idx, value in enumerate(values, start=1):
+                if value == target or target in value:
+                    mapping[key] = col_idx
+                    break
+        if len(mapping) > len(best_mapping):
+            best_row = row_idx
+            best_mapping = mapping
+
+    required = {"snils", "fio", "email"}
+    if best_row is None or not required.issubset(best_mapping):
+        missing = sorted(required - set(best_mapping))
+        raise ValueError(f"Не найдены обязательные колонки XLSX: {', '.join(missing)}")
+
+    return best_row, best_mapping
+
+
+def _looks_like_department_row(values: list[Any], snils_col: int, fio_col: int, email_col: int) -> bool:
+    snils_value = values[snils_col - 1] if snils_col <= len(values) else None
+    fio_value = values[fio_col - 1] if fio_col <= len(values) else None
+    email_value = values[email_col - 1] if email_col <= len(values) else None
+
+    if normalize_snils(snils_value) or fio_value or email_value:
+        return False
+
+    nonempty = [str(v).strip() for v in values if v is not None and str(v).strip()]
+    return len(nonempty) == 1
+
+
+def parse_xlsx(
+    path: Path,
+    columns: dict[str, str],
+    header_search_rows: int,
+    hash_secret: str,
+    login_overrides: dict[str, str],
+    sheet_name: str | None = None,
+    lowercase_login: bool = True,
+) -> list[EmployeeRecord]:
+    workbook = load_workbook(path, data_only=True, read_only=False)
+    sheet = workbook[sheet_name] if sheet_name else workbook.active
+
+    header_row, mapping = find_header_row(sheet, columns, header_search_rows)
+    snils_col = mapping["snils"]
+    fio_col = mapping["fio"]
+    email_col = mapping["email"]
+    position_col = mapping.get("position")
+
+    current_department: str | None = None
+    merged: dict[str, EmployeeRecord] = {}
+
+    for row_idx in range(header_row + 1, sheet.max_row + 1):
+        values = [sheet.cell(row=row_idx, column=col).value for col in range(1, sheet.max_column + 1)]
+
+        if _looks_like_department_row(values, snils_col, fio_col, email_col):
+            current_department = next(
+                str(v).strip() for v in values if v is not None and str(v).strip()
+            )
+            continue
+
+        snils = normalize_snils(values[snils_col - 1])
+        fio_raw = values[fio_col - 1]
+        if not snils or fio_raw is None or not str(fio_raw).strip():
+            continue
+
+        fio = " ".join(str(fio_raw).split())
+        email = normalize_email(values[email_col - 1])
+        login = None
+        if email:
+            login = login_overrides.get(email) or email.split("@", 1)[0]
+            login = login.strip()
+            if lowercase_login:
+                login = login.lower()
+
+        position = None
+        if position_col:
+            raw_position = values[position_col - 1]
+            if raw_position is not None and str(raw_position).strip():
+                position = " ".join(str(raw_position).split())
+
+        key = worker_key(snils, hash_secret)
+        existing = merged.get(key)
+        if existing:
+            departments = [item for item in [existing.department, current_department] if item]
+            positions = [item for item in [existing.position, position] if item]
+            merged[key] = EmployeeRecord(
+                worker_key=key,
+                fio=fio or existing.fio,
+                email=email or existing.email,
+                login=login or existing.login,
+                department=" / ".join(dict.fromkeys(departments)) or None,
+                position=" / ".join(dict.fromkeys(positions)) or None,
+            )
+        else:
+            merged[key] = EmployeeRecord(
+                worker_key=key,
+                fio=fio,
+                email=email,
+                login=login,
+                department=current_department,
+                position=position,
+            )
+
+    return list(merged.values())

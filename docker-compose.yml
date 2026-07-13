@@ -1,0 +1,52 @@
+services:
+  invite-mailer:
+    build: .
+    container_name: invite-mailer
+    restart: unless-stopped
+    environment:
+      TZ: "${TZ:-Europe/Moscow}"
+
+      IMAP_HOST: "${IMAP_HOST}"
+      IMAP_PORT: "${IMAP_PORT:-993}"
+      IMAP_SSL: "${IMAP_SSL:-true}"
+      IMAP_USERNAME: "${IMAP_USERNAME}"
+      IMAP_PASSWORD: "${IMAP_PASSWORD}"
+      IMAP_FOLDER: "${IMAP_FOLDER:-INBOX}"
+      IMAP_FROM_CONTAINS: "${IMAP_FROM_CONTAINS:-1c-robot@}"
+      IMAP_LOOKBACK_DAYS: "${IMAP_LOOKBACK_DAYS:-3}"
+
+      SMTP_HOST: "${SMTP_HOST}"
+      SMTP_PORT: "${SMTP_PORT:-465}"
+      SMTP_MODE: "${SMTP_MODE:-ssl}"
+      SMTP_USERNAME: "${SMTP_USERNAME}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD}"
+      SMTP_FROM_EMAIL: "${SMTP_FROM_EMAIL}"
+      SMTP_FROM_NAME: "${SMTP_FROM_NAME:-Система тестирования}"
+
+      WORKER_HASH_SECRET: "${WORKER_HASH_SECRET}"
+      LOGIN_OVERRIDES_JSON: "${LOGIN_OVERRIDES_JSON:-}"
+
+    volumes:
+      - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/data:/opt/invite-mailer/data"
+      - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/state:/opt/invite-mailer/state"
+      - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/reports:/opt/invite-mailer/reports"
+    networks:
+      - invite-mailer-net
+
+  report-web:
+    image: nginx:1.27-alpine
+    container_name: invite-mailer-report
+    restart: unless-stopped
+    depends_on:
+      - invite-mailer
+    ports:
+      - "${REPORT_BIND_IP:-0.0.0.0}:${REPORT_PORT:-8080}:80"
+    volumes:
+      - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/reports:/usr/share/nginx/html:ro"
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - invite-mailer-net
+
+networks:
+  invite-mailer-net:
+    driver: bridge

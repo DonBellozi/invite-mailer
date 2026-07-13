@@ -1,0 +1,16 @@
+templates:
+  - id: "intro_tests"
+    enabled: true
+    name: "Вводное тестирование"
+    subject: "Приглашение к прохождению тестирования"
+    body_template: "/opt/invite-mailer/templates/intro_tests.html"
+
+    # once – один раз в рамках текущего периода работы.
+    # periodic – повторно после validity_days.
+    mode: "once"
+    validity_days: null
+
+    departments:
+      include:
+        - "*"
+      exclude: []
