@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import html
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,10 @@ h1 { margin-top: 0; font-size: 24px; }
 .summary { display: flex; gap: 12px; flex-wrap: wrap; }
 .metric { min-width: 160px; background: #eef2f7; padding: 12px; border-radius: 8px; }
 .metric strong { display: block; font-size: 22px; }
-input { width: 100%; max-width: 520px; padding: 10px; margin: 8px 0 14px; border: 1px solid #ccd2da; border-radius: 6px; }
+.filters { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; margin: 8px 0 14px; }
+.filter-field { min-width: 240px; flex: 1; }
+.filter-field label { display: block; margin-bottom: 5px; color: #475467; font-size: 12px; font-weight: 600; }
+input, select { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #ccd2da; border-radius: 6px; background: #fff; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 9px 8px; border-bottom: 1px solid #e1e5ea; text-align: left; vertical-align: top; }
 th { position: sticky; top: 0; background: #f0f2f5; }
@@ -32,6 +36,25 @@ def _fmt_date(value: str | None) -> str:
         return datetime.fromisoformat(value).strftime("%d.%m.%Y %H:%M")
     except ValueError:
         return value
+
+
+def _template_applies(department: str | None, template: dict) -> bool:
+    rule = template.get("departments", {})
+    value = (department or "").lower()
+    includes = rule.get("include") or ["*"]
+    excludes = rule.get("exclude") or []
+
+    included = any(fnmatch.fnmatch(value, str(pattern).lower()) for pattern in includes)
+    excluded = any(fnmatch.fnmatch(value, str(pattern).lower()) for pattern in excludes)
+    return included and not excluded
+
+
+def _method_label(method: str | None) -> str:
+    if method == "manual_seed":
+        return "вручную"
+    if method == "automatic":
+        return "автоматически"
+    return method or ""
 
 
 def build_report(db: Database, templates: list[dict], title: str, output: Path) -> None:
@@ -53,11 +76,25 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path) 
             "SELECT COUNT(*) AS count FROM employees WHERE active = 1 AND (email IS NULL OR email = '')"
         ).fetchone()["count"]
 
+        history_template_ids = {
+            row["template_id"]
+            for row in connection.execute(
+                "SELECT DISTINCT template_id FROM notification_history"
+            ).fetchall()
+        }
+
+        visible_templates = [
+            template
+            for template in templates
+            if template.get("enabled", True) or template["id"] in history_template_ids
+        ]
+
         rows: list[str] = []
         for employee in employees:
-            for template in templates:
-                if not template.get("enabled", True):
+            for template in visible_templates:
+                if not _template_applies(employee["department"], template):
                     continue
+
                 latest = connection.execute(
                     """
                     SELECT * FROM notification_history
@@ -71,7 +108,9 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path) 
                     status = "Нет адреса электронной почты"
                     status_class = "status-error"
                 elif latest and latest["status"] == "sent":
-                    status = f"Отправлено {_fmt_date(latest['sent_at'])}"
+                    method = _method_label(latest["method"])
+                    suffix = f" – {method}" if method else ""
+                    status = f"Отправлено {_fmt_date(latest['sent_at'])}{suffix}"
                     status_class = "status-sent"
                 elif latest and latest["status"] == "error":
                     status = f"Ошибка: {latest['error_text'] or 'неизвестная ошибка'}"
@@ -89,11 +128,21 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path) 
                     template.get("name", template["id"]),
                 ]
                 cells = "".join(f"<td>{html.escape(str(value))}</td>" for value in values)
-                rows.append(f"<tr>{cells}<td class='{status_class}'>{html.escape(status)}</td></tr>")
+                template_id = html.escape(str(template["id"]), quote=True)
+                rows.append(
+                    f"<tr data-template-id='{template_id}'>{cells}"
+                    f"<td class='{status_class}'>{html.escape(status)}</td></tr>"
+                )
 
     import_text = "Нет успешно загруженных файлов"
     if last_import:
         import_text = f"{_fmt_date(last_import['imported_at'])}, сотрудников: {last_import['row_count']}"
+
+    template_options = ["<option value=''>Все тесты</option>"]
+    for template in visible_templates:
+        template_id = html.escape(str(template["id"]), quote=True)
+        template_name = html.escape(str(template.get("name", template["id"])))
+        template_options.append(f"<option value='{template_id}'>{template_name}</option>")
 
     page = f"""<!doctype html>
 <html lang="ru">
@@ -114,19 +163,46 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path) 
   <p class="small">Последний импорт: {html.escape(import_text)}</p>
 </div>
 <div class="card">
-  <input id="filter" type="search" placeholder="Поиск по ФИО, email, подразделению или тесту">
+  <div class="filters">
+    <div class="filter-field">
+      <label for="test-filter">Тест</label>
+      <select id="test-filter">{''.join(template_options)}</select>
+    </div>
+    <div class="filter-field">
+      <label for="text-filter">Поиск</label>
+      <input id="text-filter" type="search" placeholder="ФИО, email, логин, подразделение или должность">
+    </div>
+  </div>
+  <p class="small" id="visible-count"></p>
   <table id="result-table">
     <thead><tr><th>ФИО</th><th>Email</th><th>Логин</th><th>Подразделение</th><th>Должность</th><th>Тест</th><th>Статус</th></tr></thead>
     <tbody>{''.join(rows)}</tbody>
   </table>
 </div>
 <script>
-const input = document.getElementById('filter');
+const textFilter = document.getElementById('text-filter');
+const testFilter = document.getElementById('test-filter');
+const visibleCount = document.getElementById('visible-count');
 const rows = [...document.querySelectorAll('#result-table tbody tr')];
-input.addEventListener('input', () => {{
-  const query = input.value.toLowerCase();
-  rows.forEach(row => row.hidden = !row.textContent.toLowerCase().includes(query));
-}});
+
+function applyFilters() {{
+  const query = textFilter.value.trim().toLowerCase();
+  const templateId = testFilter.value;
+  let count = 0;
+
+  rows.forEach(row => {{
+    const matchesText = !query || row.textContent.toLowerCase().includes(query);
+    const matchesTest = !templateId || row.dataset.templateId === templateId;
+    row.hidden = !(matchesText && matchesTest);
+    if (!row.hidden) count += 1;
+  }});
+
+  visibleCount.textContent = `Показано записей: ${{count}}`;
+}}
+
+textFilter.addEventListener('input', applyFilters);
+testFilter.addEventListener('change', applyFilters);
+applyFilters();
 </script>
 </body>
 </html>"""
