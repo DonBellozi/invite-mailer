@@ -25,7 +25,8 @@ services:
       SMTP_FROM_NAME: "${SMTP_FROM_NAME:-Система тестирования}"
 
       WORKER_HASH_SECRET: "${WORKER_HASH_SECRET}"
-      LOGIN_OVERRIDES_JSON: {"aksenova.ey@roskapstroy.com":"eaksenova","belikov.iv@domain.ru":"belikov","sadov.aa@roskapstroy.com":"Sadov","mezentsev.md@roskapstroy.com":"mezentsev","sv@roskapstroy.com":"shcherbakov2"}
+      LOGIN_OVERRIDES_JSON: >-
+        {"aksenova.ey@roskapstroy.com":"eaksenova","belikov.iv@domain.ru":"belikov","sadov.aa@roskapstroy.com":"Sadov","mezentsev.md@roskapstroy.com":"mezentsev","sv@roskapstroy.com":"shcherbakov2"}
 
 
     volumes:
