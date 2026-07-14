@@ -17,6 +17,7 @@ h1 { margin-top: 0; font-size: 24px; }
 .metric strong { display: block; font-size: 22px; }
 .filters { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; margin: 8px 0 14px; }
 .filter-field { min-width: 220px; flex: 1; }
+.filter-field-search { flex: 2; min-width: 320px; }
 .filter-field label { display: block; margin-bottom: 5px; color: #475467; font-size: 12px; font-weight: 600; }
 input, select { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #ccd2da; border-radius: 6px; background: #fff; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -198,6 +199,10 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path) 
 </div>
 <div class="card">
   <div class="filters">
+    <div class="filter-field filter-field-search">
+      <label for="text-filter">Поиск</label>
+      <input id="text-filter" type="search" placeholder="ФИО, email, логин, подразделение или должность">
+    </div>
     <div class="filter-field">
       <label for="test-filter">Тест</label>
       <select id="test-filter">{''.join(template_options)}</select>
@@ -205,10 +210,6 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path) 
     <div class="filter-field">
       <label for="status-filter">Статус</label>
       <select id="status-filter">{status_options}</select>
-    </div>
-    <div class="filter-field">
-      <label for="text-filter">Поиск</label>
-      <input id="text-filter" type="search" placeholder="ФИО, email, логин, подразделение или должность">
     </div>
   </div>
   <p class="small" id="visible-count"></p>
