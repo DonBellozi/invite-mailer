@@ -1,48 +1,64 @@
-services:
-  invite-mailer:
-    build: .
-    pull_policy: build
-    container_name: invite-mailer
-    restart: unless-stopped
-    environment:
-      TZ: "${TZ:-Europe/Moscow}"
+x-app-environment: &app-environment
+  TZ: "${TZ:-Europe/Moscow}"
 
-      IMAP_HOST: "${IMAP_HOST}"
-      IMAP_PORT: "${IMAP_PORT:-993}"
-      IMAP_SSL: "${IMAP_SSL:-true}"
-      IMAP_USERNAME: "${IMAP_USERNAME}"
-      IMAP_PASSWORD: "${IMAP_PASSWORD}"
-      IMAP_FOLDER: "${IMAP_FOLDER:-INBOX}"
-      IMAP_FROM_CONTAINS: "${IMAP_FROM_CONTAINS:-1c-robot@}"
-      IMAP_LOOKBACK_DAYS: "${IMAP_LOOKBACK_DAYS:-3}"
+  IMAP_HOST: "${IMAP_HOST}"
+  IMAP_PORT: "${IMAP_PORT:-993}"
+  IMAP_SSL: "${IMAP_SSL:-true}"
+  IMAP_USERNAME: "${IMAP_USERNAME}"
+  IMAP_PASSWORD: "${IMAP_PASSWORD}"
+  IMAP_FOLDER: "${IMAP_FOLDER:-INBOX}"
+  IMAP_FROM_CONTAINS: "${IMAP_FROM_CONTAINS:-1c-robot@}"
+  IMAP_LOOKBACK_DAYS: "${IMAP_LOOKBACK_DAYS:-3}"
 
-      SMTP_HOST: "${SMTP_HOST}"
-      SMTP_PORT: "${SMTP_PORT:-465}"
-      SMTP_MODE: "${SMTP_MODE:-ssl}"
-      SMTP_USERNAME: "${SMTP_USERNAME}"
-      SMTP_PASSWORD: "${SMTP_PASSWORD}"
-      SMTP_FROM_EMAIL: "${SMTP_FROM_EMAIL}"
-      SMTP_FROM_NAME: "${SMTP_FROM_NAME:-Система тестирования}"
+  SMTP_HOST: "${SMTP_HOST}"
+  SMTP_PORT: "${SMTP_PORT:-465}"
+  SMTP_MODE: "${SMTP_MODE:-ssl}"
+  SMTP_USERNAME: "${SMTP_USERNAME}"
+  SMTP_PASSWORD: "${SMTP_PASSWORD}"
+  SMTP_FROM_EMAIL: "${SMTP_FROM_EMAIL}"
+  SMTP_FROM_NAME: "${SMTP_FROM_NAME:-Система тестирования}"
 
-      WORKER_HASH_SECRET: "${WORKER_HASH_SECRET}"
-      LOGIN_OVERRIDES_JSON: >-
+  WORKER_HASH_SECRET: "${WORKER_HASH_SECRET}"
+  LOGIN_OVERRIDES_JSON: >-
         {"aksenova.ey@roskapstroy.com":"eaksenova","belikov.iv@domain.ru":"belikov","sadov.aa@roskapstroy.com":"Sadov","mezentsev.md@roskapstroy.com":"mezentsev","sv@roskapstroy.com":"shcherbakov2"}
 
+  ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+  ADMIN_PASSWORD: "${ADMIN_PASSWORD:-roskapstroy}"
 
-    volumes:
-      - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/data:/opt/invite-mailer/data"
-      - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/state:/opt/invite-mailer/state"
-      - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/reports:/opt/invite-mailer/reports"
+x-app-volumes: &app-volumes
+  - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/data:/opt/invite-mailer/data"
+  - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/state:/opt/invite-mailer/state"
+  - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/reports:/opt/invite-mailer/reports"
+
+services:
+  invite-mailer:
+    image: invite-mailer-app:latest
+    build: .
+    container_name: invite-mailer
+    restart: unless-stopped
+    environment: *app-environment
+    volumes: *app-volumes
+    networks:
+      - invite-mailer-net
+
+  invite-mailer-admin:
+    image: invite-mailer-app:latest
+    build: .
+    container_name: invite-mailer-admin
+    restart: unless-stopped
+    command: ["uvicorn", "app.admin_web:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *app-environment
+    volumes: *app-volumes
     networks:
       - invite-mailer-net
 
   report-web:
-    build:
-      context: ./nginx
+    build: ./nginx
     container_name: invite-mailer-report
     restart: unless-stopped
     depends_on:
       - invite-mailer
+      - invite-mailer-admin
     ports:
       - "${REPORT_BIND_IP:-0.0.0.0}:${REPORT_PORT:-8080}:80"
     volumes:

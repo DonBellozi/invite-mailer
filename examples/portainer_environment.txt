@@ -1,0 +1,4 @@
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=ЗАМЕНИТЕ_НА_ДЛИННЫЙ_СЛУЧАЙНЫЙ_ПАРОЛЬ
+
+Важно: сохраните текущее значение LOGIN_OVERRIDES_JSON при обновлении docker-compose.yml.

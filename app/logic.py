@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import fnmatch
-import json
 import shutil
 import time
 from datetime import datetime, timedelta
@@ -9,6 +8,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
+from .audience import is_explicit_template
 from .db import Database
 from .imap_source import fetch_latest_attachment
 from .mailer import send_html_email
@@ -31,8 +31,32 @@ def _department_matches(department: str | None, rule: dict) -> bool:
     return included and not excluded
 
 
-def _template_applies(employee, template: dict) -> bool:
-    return _department_matches(employee["department"], template.get("departments", {}))
+def _candidate_employees(connection, template: dict):
+    """Возвращает только сотрудников, которым применим конкретный шаблон."""
+    if is_explicit_template(template):
+        return connection.execute(
+            """
+            SELECT e.*
+            FROM test_assignments a
+            JOIN employees e
+              ON e.worker_key = a.worker_key
+             AND e.employment_seq = a.employment_seq
+            WHERE a.template_id = ?
+              AND a.active = 1
+              AND e.active = 1
+            ORDER BY e.fio
+            """,
+            (template["id"],),
+        ).fetchall()
+
+    employees = connection.execute(
+        "SELECT * FROM employees WHERE active = 1 ORDER BY fio"
+    ).fetchall()
+    return [
+        employee
+        for employee in employees
+        if _department_matches(employee["department"], template.get("departments", {}))
+    ]
 
 
 def _is_due(connection, employee, template: dict, now: datetime) -> bool:
@@ -137,9 +161,22 @@ def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_
                 )
 
 
-def fetch_and_import(settings: Settings, db: Database) -> Path:
+def _parse_employee_file(settings: Settings, path: Path) -> list[EmployeeRecord]:
     source = settings.config["source"]
     xlsx_cfg = settings.config["xlsx"]
+    return parse_xlsx(
+        path,
+        xlsx_cfg["columns"],
+        int(xlsx_cfg.get("header_search_rows", 20)),
+        settings.worker_hash_secret,
+        settings.login_overrides,
+        sheet_name=source.get("sheet_name"),
+        lowercase_login=bool(settings.config.get("identity", {}).get("lowercase", True)),
+    )
+
+
+def fetch_and_import(settings: Settings, db: Database) -> Path:
+    source = settings.config["source"]
     archive_dir = settings.data_path / "archive"
     current_file = settings.data_path / "current.xlsx"
 
@@ -154,20 +191,16 @@ def fetch_and_import(settings: Settings, db: Database) -> Path:
             "SELECT id FROM imports WHERE file_hash = ? AND status = 'success'",
             (result.file_hash,),
         ).fetchone()
+
     if duplicate:
         if not current_file.exists():
             shutil.copy2(result.saved_path, current_file)
+        # Даже для уже обработанного XLSX заново применяем LOGIN_OVERRIDES_JSON.
+        records = _parse_employee_file(settings, current_file)
+        import_employees(db, records, int(source.get("absence_grace_imports", 1)))
         return current_file
 
-    records = parse_xlsx(
-        result.saved_path,
-        xlsx_cfg["columns"],
-        int(xlsx_cfg.get("header_search_rows", 20)),
-        settings.worker_hash_secret,
-        settings.login_overrides,
-        sheet_name=source.get("sheet_name"),
-        lowercase_login=bool(settings.config.get("identity", {}).get("lowercase", True)),
-    )
+    records = _parse_employee_file(settings, result.saved_path)
 
     min_employees = int(source.get("min_employees", 1))
     if len(records) < min_employees:
@@ -231,20 +264,12 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
     summary = {"sent": 0, "skipped": 0, "errors": 0, "dry_run": dry_run}
 
     with db.connect() as connection:
-        employees = connection.execute(
-            """
-            SELECT *
-            FROM employees
-            WHERE active = 1
-              AND email IS NOT NULL
-              AND trim(email) <> ''
-            """
-        ).fetchall()
+        for template in settings.templates:
+            if not template.get("enabled", True):
+                continue
 
-        for employee in employees:
-            for template in settings.templates:
-                if not template.get("enabled", True) or not _template_applies(employee, template):
-                    continue
+            employees = _candidate_employees(connection, template)
+            for employee in employees:
                 if not _is_due(connection, employee, template, start):
                     summary["skipped"] += 1
                     continue
@@ -352,16 +377,20 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
 
 def seed_manual(settings: Settings, db: Database, template_ids: list[str], sent_date: str) -> int:
     timestamp = datetime.fromisoformat(sent_date).replace(hour=12, minute=0, second=0).isoformat()
-    valid_ids = {template["id"] for template in settings.templates}
-    unknown = set(template_ids) - valid_ids
+    templates_by_id = {template["id"]: template for template in settings.templates}
+    unknown = set(template_ids) - set(templates_by_id)
     if unknown:
         raise ValueError(f"Неизвестные шаблоны: {', '.join(sorted(unknown))}")
 
     count = 0
     with db.connect() as connection:
-        employees = connection.execute("SELECT * FROM employees WHERE active = 1").fetchall()
-        for employee in employees:
-            for template_id in template_ids:
+        for template_id in template_ids:
+            template = templates_by_id[template_id]
+            employees = _candidate_employees(connection, template)
+            for employee in employees:
+                # Нулевая рассылка не должна отмечать уведомленными людей без email.
+                if not employee["email"]:
+                    continue
                 exists = connection.execute(
                     """
                     SELECT id FROM notification_history

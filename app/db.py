@@ -70,6 +70,68 @@ CREATE TABLE IF NOT EXISTS app_state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+
+CREATE TABLE IF NOT EXISTS audience_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id TEXT NOT NULL,
+    original_filename TEXT NOT NULL,
+    saved_path TEXT NOT NULL,
+    file_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    total_rows INTEGER NOT NULL DEFAULT 0,
+    ready_rows INTEGER NOT NULL DEFAULT 0,
+    warning_rows INTEGER NOT NULL DEFAULT 0,
+    error_rows INTEGER NOT NULL DEFAULT 0,
+    confirmed_rows INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT,
+    uploaded_by TEXT,
+    metadata_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audience_imports_template
+ON audience_imports(template_id, created_at);
+
+CREATE TABLE IF NOT EXISTS audience_import_rows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL,
+    row_number INTEGER NOT NULL,
+    source_email TEXT,
+    normalized_email TEXT,
+    status TEXT NOT NULL,
+    error_text TEXT,
+    worker_key TEXT,
+    employment_seq INTEGER,
+    employee_fio TEXT,
+    employee_email TEXT,
+    employee_login TEXT,
+    employee_department TEXT,
+    employee_position TEXT,
+    selected INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(import_id) REFERENCES audience_imports(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_audience_import_rows_import
+ON audience_import_rows(import_id, status, row_number);
+
+CREATE TABLE IF NOT EXISTS test_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id TEXT NOT NULL,
+    worker_key TEXT NOT NULL,
+    employment_seq INTEGER NOT NULL,
+    source_import_id INTEGER,
+    source_row_id INTEGER,
+    assigned_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY(worker_key) REFERENCES employees(worker_key),
+    FOREIGN KEY(source_import_id) REFERENCES audience_imports(id),
+    FOREIGN KEY(source_row_id) REFERENCES audience_import_rows(id),
+    UNIQUE(template_id, worker_key, employment_seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_assignments_lookup
+ON test_assignments(template_id, active, worker_key, employment_seq);
 """
 
 
@@ -82,8 +144,10 @@ class Database:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=10000")
         try:
             yield connection
             connection.commit()

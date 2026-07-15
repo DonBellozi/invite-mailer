@@ -1,0 +1,11 @@
+# Добавьте этот блок внутрь списка templates: в существующем config/templates.yaml.
+# Измените id, name, subject и body_template под реальный тест.
+- id: "special_test"
+  enabled: false
+  name: "Название выборочного теста"
+  subject: "Приглашение к прохождению тестирования"
+  body_template: "/opt/invite-mailer/templates/special_test.html"
+  mode: "once"
+  validity_days: null
+  audience:
+    type: "explicit_list"

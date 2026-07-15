@@ -5,13 +5,17 @@ import html
 from datetime import datetime
 from pathlib import Path
 
+from .audience import is_explicit_template
 from .db import Database
 
 
 CSS = """
 body { font-family: Arial, sans-serif; margin: 24px; color: #222; background: #f5f6f8; }
 .card { background: white; border-radius: 10px; padding: 18px; margin-bottom: 18px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
-h1 { margin-top: 0; font-size: 24px; }
+.header-line { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+h1 { margin: 0 0 14px; font-size: 24px; }
+.admin-link { display: inline-block; padding: 9px 13px; border: 1px solid #98a2b3; border-radius: 7px; color: #344054; text-decoration: none; font-size: 13px; font-weight: 600; background: #fff; }
+.admin-link:hover { background: #f2f4f7; }
 .summary { display: flex; gap: 12px; flex-wrap: wrap; }
 .metric { min-width: 160px; background: #eef2f7; padding: 12px; border-radius: 8px; }
 .metric strong { display: block; font-size: 22px; }
@@ -20,6 +24,7 @@ h1 { margin-top: 0; font-size: 24px; }
 .filter-field-search { flex: 2; min-width: 320px; }
 .filter-field label { display: block; margin-bottom: 5px; color: #475467; font-size: 12px; font-weight: 600; }
 input, select { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #ccd2da; border-radius: 6px; background: #fff; }
+.table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 9px 8px; border-bottom: 1px solid #e1e5ea; text-align: left; vertical-align: top; }
 th { position: sticky; top: 0; background: #f0f2f5; }
@@ -28,6 +33,7 @@ th { position: sticky; top: 0; background: #f0f2f5; }
 .status-sent { color: #176b36; font-weight: 600; }
 .status-wait { color: #8a5b00; font-weight: 600; }
 .status-error { color: #a21d1d; font-weight: 600; }
+.status-inactive { color: #667085; font-weight: 600; }
 .small { color: #667085; font-size: 12px; }
 """
 
@@ -45,7 +51,7 @@ def _fmt_date(value: str | None) -> str:
         return value
 
 
-def _template_applies(department: str | None, template: dict) -> bool:
+def _department_applies(department: str | None, template: dict) -> bool:
     rule = template.get("departments", {})
     value = (department or "").lower()
     includes = rule.get("include") or ["*"]
@@ -65,7 +71,9 @@ def _method_label(method: str | None) -> str:
 
 
 def _row_status(employee, latest) -> tuple[str, str, str]:
-    """Возвращает: текст статуса, CSS-класс, ключ для фильтра."""
+    if not employee["active"]:
+        return "Сотрудник неактивен", "status-inactive", "inactive"
+
     if not employee["email"]:
         return "Нет адреса электронной почты", "status-error", "no_email"
 
@@ -94,13 +102,38 @@ def _row_status(employee, latest) -> tuple[str, str, str]:
     return "Ожидает отправки", "status-wait", "waiting"
 
 
+def _report_employees(connection, template: dict):
+    if is_explicit_template(template):
+        return connection.execute(
+            """
+            SELECT e.*
+            FROM test_assignments a
+            JOIN employees e
+              ON e.worker_key = a.worker_key
+             AND e.employment_seq = a.employment_seq
+            WHERE a.template_id = ? AND a.active = 1
+            ORDER BY e.department, e.fio
+            """,
+            (template["id"],),
+        ).fetchall()
+
+    employees = connection.execute(
+        "SELECT * FROM employees WHERE active = 1 ORDER BY department, fio"
+    ).fetchall()
+    return [
+        employee
+        for employee in employees
+        if _department_applies(employee["department"], template)
+    ]
+
+
 def build_report(db: Database, templates: list[dict], title: str, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     with db.connect() as connection:
-        employees = connection.execute(
-            "SELECT * FROM employees WHERE active = 1 ORDER BY department, fio"
-        ).fetchall()
+        employee_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM employees WHERE active = 1"
+        ).fetchone()["count"]
         last_import = connection.execute(
             "SELECT * FROM imports WHERE status = 'success' ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -119,19 +152,24 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path) 
                 "SELECT DISTINCT template_id FROM notification_history"
             ).fetchall()
         }
+        assignment_template_ids = {
+            row["template_id"]
+            for row in connection.execute(
+                "SELECT DISTINCT template_id FROM test_assignments WHERE active = 1"
+            ).fetchall()
+        }
 
         visible_templates = [
             template
             for template in templates
-            if template.get("enabled", True) or template["id"] in history_template_ids
+            if template.get("enabled", True)
+            or template["id"] in history_template_ids
+            or template["id"] in assignment_template_ids
         ]
 
         rows: list[str] = []
-        for employee in employees:
-            for template in visible_templates:
-                if not _template_applies(employee["department"], template):
-                    continue
-
+        for template in visible_templates:
+            for employee in _report_employees(connection, template):
                 latest = connection.execute(
                     """
                     SELECT * FROM notification_history
@@ -177,6 +215,7 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path) 
 <option value="waiting">Ожидает отправки</option>
 <option value="error">Ошибка отправки</option>
 <option value="no_email">Нет email</option>
+<option value="inactive">Сотрудник неактивен</option>
 """.strip()
 
     page = f"""<!doctype html>
@@ -189,9 +228,12 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path) 
 </head>
 <body>
 <div class="card">
-  <h1>{html.escape(title)}</h1>
+  <div class="header-line">
+    <h1>{html.escape(title)}</h1>
+    <a class="admin-link" href="/admin/">Импорт списков участников</a>
+  </div>
   <div class="summary">
-    <div class="metric"><strong>{len(employees)}</strong>актуальных сотрудников</div>
+    <div class="metric"><strong>{employee_count}</strong>актуальных сотрудников</div>
     <div class="metric"><strong>{sent_total}</strong>успешных отправок</div>
     <div class="metric"><strong>{missing_email}</strong>без email</div>
   </div>
@@ -213,10 +255,12 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path) 
     </div>
   </div>
   <p class="small" id="visible-count"></p>
-  <table id="result-table">
-    <thead><tr><th>ФИО</th><th>Email</th><th>Логин</th><th>Подразделение</th><th>Должность</th><th>Тест</th><th>Статус</th></tr></thead>
-    <tbody>{''.join(rows)}</tbody>
-  </table>
+  <div class="table-wrap">
+    <table id="result-table">
+      <thead><tr><th>ФИО</th><th>Email</th><th>Логин</th><th>Подразделение</th><th>Должность</th><th>Тест</th><th>Статус</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+  </div>
 </div>
 <script>
 const textFilter = document.getElementById('text-filter');
