@@ -232,7 +232,13 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
 
     with db.connect() as connection:
         employees = connection.execute(
-            "SELECT * FROM employees WHERE active = 1 ORDER BY fio"
+            """
+            SELECT *
+            FROM employees
+            WHERE active = 1
+              AND email IS NOT NULL
+              AND trim(email) <> ''
+            """
         ).fetchall()
 
         for employee in employees:
