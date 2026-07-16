@@ -15,7 +15,7 @@ templates:
 
 # Антикоррупция
   - id: "anticorruption"
-    enabled: false
+    enabled: true
     name: "Антикоррупция"
     subject: "Обязательное прохождение тренинга и тестирования по антикоррупционной безопасности"
     body_template: "/opt/invite-mailer/templates/anticorruption.html"
