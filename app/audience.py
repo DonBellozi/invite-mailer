@@ -10,20 +10,36 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
+from openpyxl.styles import Font, PatternFill
 
 from .db import Database
 from .settings import Settings
 from .xlsx_parser import normalize_email
 
 
+EXACT_EMAIL_HEADER_SCORES = {
+    # Новый отчет об ошибках можно повторно загрузить без подготовки.
+    "email": 1000,
+    # Совместимость с отчетами, сформированными предыдущей версией.
+    "нормализованный email": 950,
+    "адрес электронной почты": 900,
+    "e-mail": 880,
+    "e mail": 870,
+    "электронная почта": 860,
+    "электронный адрес": 850,
+    "email из файла": 800,
+    "почта": 700,
+}
+
 EMAIL_HEADER_VARIANTS = {
-    "email": 100,
-    "e-mail": 100,
-    "e mail": 95,
-    "адрес электронной почты": 100,
-    "электронная почта": 95,
-    "электронный адрес": 90,
-    "почта": 60,
+    "адрес электронной почты": 300,
+    "электронная почта": 280,
+    "электронный адрес": 260,
+    "email": 240,
+    "e-mail": 240,
+    "e mail": 220,
+    "почта": 120,
 }
 SAFE_FILENAME_RE = re.compile(r"[^0-9A-Za-zА-Яа-я._-]+")
 
@@ -81,11 +97,15 @@ def _header_score(value: Any) -> int:
     if not normalized:
         return 0
 
+    # Точный заголовок Email всегда имеет приоритет. Это позволяет повторно
+    # загружать сформированный отчет об ошибках после исправления адресов.
+    exact_score = EXACT_EMAIL_HEADER_SCORES.get(normalized)
+    if exact_score is not None:
+        return exact_score
+
     best = 0
     for variant, score in EMAIL_HEADER_VARIANTS.items():
-        if normalized == variant:
-            best = max(best, score + 20)
-        elif variant in normalized:
+        if variant in normalized:
             best = max(best, score)
     return best
 
@@ -518,9 +538,9 @@ def build_issues_workbook(db: Database, import_id: int) -> bytes:
     sheet.title = "Ошибки импорта"
     sheet.append(
         [
-            "Строка",
-            "Email из файла",
-            "Нормализованный email",
+            "Строка исходного файла",
+            "Исходное значение",
+            "Email",
             "ФИО из основной базы",
             "Подразделение",
             "Должность",
@@ -529,6 +549,16 @@ def build_issues_workbook(db: Database, import_id: int) -> bytes:
             "Причина",
         ]
     )
+
+    # Колонка Email предназначена для исправления и повторной загрузки файла.
+    email_header = sheet["C1"]
+    email_header.comment = Comment(
+        "Исправьте адреса в этой колонке и загрузите этот же файл повторно.",
+        "Invite Mailer",
+    )
+    email_fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
+    email_header.fill = email_fill
+    email_header.font = Font(bold=True)
 
     for row in rows:
         sheet.append(
@@ -544,8 +574,10 @@ def build_issues_workbook(db: Database, import_id: int) -> bytes:
                 row["error_text"],
             ]
         )
+        sheet.cell(row=sheet.max_row, column=3).fill = email_fill
 
     sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
     for column in sheet.columns:
         max_length = max(len(str(cell.value or "")) for cell in column)
         sheet.column_dimensions[column[0].column_letter].width = min(max_length + 2, 55)
