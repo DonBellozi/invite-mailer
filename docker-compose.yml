@@ -41,7 +41,6 @@ x-app-volumes: &app-volumes
 
 services:
   invite-mailer:
-    image: invite-mailer-app:latest
     build: .
     container_name: invite-mailer
     restart: unless-stopped
@@ -51,7 +50,6 @@ services:
       - invite-mailer-net
 
   invite-mailer-admin:
-    image: invite-mailer-app:latest
     build: .
     container_name: invite-mailer-admin
     restart: unless-stopped
