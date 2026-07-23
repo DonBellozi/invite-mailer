@@ -427,15 +427,43 @@ th { background: #f0f2f5; }
 </head>
 <body>
 <div class="card">
-  <div class="header-line">
-    <div>
+  <div class="page-header">
+
+    <div class="page-header-main">
       <h1>Сопоставление e-mail и логина</h1>
-      <div class="small">Используется только для работников, у которых логин Indigo не совпадает с частью e-mail до знака @. Изменения применяются сразу.</div>
+
+      <div class="small">
+        Используется только для работников, у которых логин Indigo
+        не совпадает с частью e-mail до знака @.
+        Изменения применяются сразу.
+      </div>
     </div>
-    <div class="actions">
-      <a class="back-link" href="/admin/">Импорт участников</a>
-      <a class="back-link" href="/">Вернуться к отчету</a>
+
+    <div class="page-header-template">
+      <a
+        class="header-button template-button"
+        href="/api/audience/template.xlsx"
+      >
+        Скачать шаблон
+      </a>
     </div>
+
+    <div class="page-header-actions">
+      <a
+        class="header-button"
+        href="/admin/"
+      >
+        Импорт участников
+      </a>
+
+      <a
+        class="header-button"
+        href="/"
+      >
+        Вернуться к отчету
+      </a>
+    </div>
+
   </div>
 </div>
 <div class="card">
@@ -663,15 +691,43 @@ tr.error { background: #fff5f5; }
 </head>
 <body>
 <div class="card">
-  <div class="header-line">
-    <div>
+  <div class="page-header">
+
+    <div class="page-header-main">
       <h1>Импорт списков участников</h1>
-      <div class="small">Файл используется только для отбора по email. ФИО, подразделение, должность и логин берутся из основной ежедневной базы.</div>
+
+      <div class="small">
+        Файл используется только для отбора по email.
+        ФИО, подразделение, должность и логин берутся
+        из основной ежедневной базы.
+      </div>
     </div>
-    <div class="actions">
-      <a class="back-link" href="/admin/logins/">Сопоставление логинов</a>
-      <a class="back-link" href="/">Вернуться к отчету</a>
+
+    <div class="page-header-template">
+      <a
+        class="header-button template-button"
+        href="/api/audience/template.xlsx"
+      >
+        Скачать шаблон
+      </a>
     </div>
+
+    <div class="page-header-actions">
+      <a
+        class="header-button"
+        href="/admin/logins/"
+      >
+        Сопоставление логинов
+      </a>
+
+      <a
+        class="header-button"
+        href="/"
+      >
+        Вернуться к отчету
+      </a>
+    </div>
+
   </div>
 </div>
 
