@@ -34,7 +34,7 @@ x-app-environment: &app-environment
   INDIGO_DB_CONNECT_TIMEOUT: "${INDIGO_DB_CONNECT_TIMEOUT:-5}"
 
   ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
-  ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+  ADMIN_PASSWORD: "${ADMIN_PASSWORD:-roskapstroy}"
 
 x-app-volumes: &app-volumes
   - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/data:/opt/invite-mailer/data"
