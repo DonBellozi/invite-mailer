@@ -21,7 +21,7 @@ def build_audience_template() -> bytes:
 
     participants = workbook.active
     participants.title = "Участники"
-    participants.sheet_view.showGridLines = False
+    participants.sheet_view.showGridLines = True
     participants.freeze_panes = "A2"
 
     headers = (
@@ -128,7 +128,7 @@ def build_audience_template() -> bytes:
     email_validation.add("C2:C10000")
 
     instructions = workbook.create_sheet("Инструкция")
-    instructions.sheet_view.showGridLines = False
+    instructions.sheet_view.showGridLines = True
     instructions.column_dimensions["A"].width = 115
 
     instructions["A1"] = "Шаблон списка участников тестирования"

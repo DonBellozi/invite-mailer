@@ -439,15 +439,6 @@ th { background: #f0f2f5; }
       </div>
     </div>
 
-    <div class="page-header-template">
-      <a
-        class="header-button template-button"
-        href="/api/audience/template.xlsx"
-      >
-        Скачать шаблон
-      </a>
-    </div>
-
     <div class="page-header-actions">
       <a
         class="header-button"
