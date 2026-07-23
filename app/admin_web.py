@@ -480,7 +480,15 @@ th { background: #f0f2f5; }
   <p id="count" class="small"></p>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>E-mail</th><th>Логин Indigo</th><th>Сотрудник</th><th>Изменено</th><th></th></tr></thead>
+      <thead>
+          <tr>
+            <th>Работник</th>
+            <th>E-mail</th>
+            <th>Логин</th>
+            <th>Изменено</th>
+            <th></th>
+          </tr>
+        </thead>
       <tbody id="mapping-body"></tbody>
     </table>
   </div>
@@ -507,25 +515,162 @@ function formatDate(value) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('ru-RU');
 }
 function render() {
-  const query = document.getElementById('search').value.trim().toLowerCase();
-  const filtered = items.filter(item => !query || [item.email, item.login, item.fio].join(' ').toLowerCase().includes(query));
-  document.getElementById('count').textContent = `Показано сопоставлений: ${filtered.length}`;
-  document.getElementById('mapping-body').innerHTML = filtered.map(item => `
-    <tr>
-      <td>${escapeHtml(item.email)}</td>
-      <td>${escapeHtml(item.login)}</td>
-      <td>${escapeHtml(item.fio || 'Не найден в текущей базе')}${item.fio && item.active === false ? '<div class="small">Сотрудник неактивен</div>' : ''}</td>
-      <td>${escapeHtml(formatDate(item.updated_at))}</td>
-      <td><button class="danger" type="button" data-email="${escapeHtml(item.email)}">Удалить</button></td>
-    </tr>`).join('');
-  document.querySelectorAll('button[data-email]').forEach(button => button.addEventListener('click', async () => {
-    if (!confirm(`Удалить сопоставление для ${button.dataset.email}?`)) return;
-    try {
-      await api(`/api/login-overrides/${encodeURIComponent(button.dataset.email)}`, {method: 'DELETE'});
-      await load();
-      showMessage('Сопоставление удалено. Для сотрудника снова используется часть e-mail до знака @.', 'success');
-    } catch (error) { showMessage(error.message, 'error'); }
-  }));
+  const query = document
+    .getElementById('search')
+    .value
+    .trim()
+    .toLowerCase();
+
+  const filtered = items
+    .filter(item => {
+      const searchText = [
+        item.fio,
+        item.email,
+        item.login
+      ]
+        .join(' ')
+        .toLowerCase();
+
+      return !query || searchText.includes(query);
+    })
+    .sort((left, right) => {
+      const leftMissing =
+        !String(left.fio || '').trim();
+
+      const rightMissing =
+        !String(right.fio || '').trim();
+
+      /*
+       * Сопоставления, для которых работник не найден
+       * в текущей базе, всегда показываем первыми.
+       */
+      if (leftMissing !== rightMissing) {
+        return leftMissing ? -1 : 1;
+      }
+
+      /*
+       * Остальных сортируем по ФИО.
+       */
+      const fioComparison = String(
+        left.fio || ''
+      ).localeCompare(
+        String(right.fio || ''),
+        'ru',
+        {
+          sensitivity: 'base'
+        }
+      );
+
+      if (fioComparison !== 0) {
+        return fioComparison;
+      }
+
+      /*
+       * При одинаковом ФИО или отсутствии ФИО
+       * сортируем по адресу электронной почты.
+       */
+      return String(
+        left.email || ''
+      ).localeCompare(
+        String(right.email || ''),
+        'ru',
+        {
+          sensitivity: 'base'
+        }
+      );
+    });
+
+  document.getElementById(
+    'count'
+  ).textContent =
+    `Показано сопоставлений: ${filtered.length}`;
+
+  document.getElementById(
+    'mapping-body'
+  ).innerHTML = filtered.map(item => {
+    const worker = item.fio
+      ? escapeHtml(item.fio)
+      : 'Не найден в текущей базе';
+
+    const inactive = (
+      item.fio && item.active === false
+    )
+      ? '<div class="small">Работник неактивен</div>'
+      : '';
+
+    return `
+      <tr>
+        <td>
+          ${worker}
+          ${inactive}
+        </td>
+
+        <td>
+          ${escapeHtml(item.email)}
+        </td>
+
+        <td>
+          ${escapeHtml(item.login)}
+        </td>
+
+        <td>
+          ${escapeHtml(formatDate(item.updated_at))}
+        </td>
+
+        <td>
+          <button
+            class="danger"
+            type="button"
+            data-email="${escapeHtml(item.email)}"
+          >
+            Удалить
+          </button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  document
+    .querySelectorAll('button[data-email]')
+    .forEach(button => {
+      button.addEventListener(
+        'click',
+        async () => {
+          if (
+            !confirm(
+              `Удалить сопоставление для ${button.dataset.email}?`
+            )
+          ) {
+            return;
+          }
+
+          try {
+            await api(
+              `/api/login-overrides/${
+                encodeURIComponent(
+                  button.dataset.email
+                )
+              }`,
+              {
+                method: 'DELETE'
+              }
+            );
+
+            await load();
+
+            showMessage(
+              'Сопоставление удалено. Для работника снова используется часть e-mail до знака @.',
+              'success'
+            );
+          } catch (error) {
+            showMessage(
+              error.message,
+              'error'
+            );
+          }
+        }
+      );
+    });
 }
 async function load() {
   const payload = await api('/api/login-overrides');
