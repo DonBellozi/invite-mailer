@@ -20,10 +20,6 @@ x-app-environment: &app-environment
 
   WORKER_HASH_SECRET: "${WORKER_HASH_SECRET}"
 
-  # Прежний JSON используется только как источник первоначального переноса
-  # в раздел админки «Сопоставление логинов».
-  LOGIN_OVERRIDES_JSON: "${LOGIN_OVERRIDES_JSON}"
-
   # Все параметры PostgreSQL Indigo задаются только во внешнем окружении:
   # в .env при обычном Docker Compose или в Environment variables стека Portainer.
   INDIGO_ENABLED: "${INDIGO_ENABLED}"
