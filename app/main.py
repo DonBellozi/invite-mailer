@@ -119,8 +119,17 @@ def main() -> int:
         return 0
 
     if args.command == "indigo-sync":
-        count = sync_indigo_results(settings, db)
-        rebuild_report(settings, db, sync_indigo=False)
+        try:
+            count = sync_indigo_results(settings, db)
+        finally:
+            # Отчет пересобирается после любой попытки синхронизации:
+            # как успешной, так и завершившейся ошибкой.
+            rebuild_report(
+                settings,
+                db,
+                sync_indigo=False,
+            )
+
         print(f"Загружено результатов Indigo: {count}")
         return 0
 

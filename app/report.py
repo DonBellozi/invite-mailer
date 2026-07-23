@@ -94,6 +94,58 @@ h2.dashboard-title {
   background: #f2f4f7;
 }
 
+.test-header-line {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.test-header-line .dashboard-title {
+  flex: 1 1 auto;
+}
+
+.export-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.export-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  border: 1px solid #98a2b3;
+  border-radius: 7px;
+  background: #fff;
+  color: #344054;
+  text-decoration: none;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.export-link:hover {
+  background: #f2f4f7;
+  border-color: #667085;
+}
+
+.export-link-xlsx:hover {
+  color: #176b36;
+  border-color: #32a852;
+  background: #f0fdf4;
+}
+
+.export-link-pdf:hover {
+  color: #b42318;
+  border-color: #f04438;
+  background: #fef3f2;
+}
+
 .summary {
   display: flex;
   gap: 10px;
@@ -822,34 +874,56 @@ def build_report(
       class="dashboard-test hidden"
     >
       <div class="dashboard-test-inner">
-        <h2
-          id="test-dashboard-title"
-          class="dashboard-title"
-        >
-          Тест
-        </h2>
-
+    
+        <div class="test-header-line">
+          <h2
+            id="test-dashboard-title"
+            class="dashboard-title"
+          >
+            Тест
+          </h2>
+    
+          <div class="export-actions">
+            <a
+              id="export-xlsx"
+              class="export-link export-link-xlsx"
+              href="#"
+            >
+              Экспорт XLSX
+            </a>
+    
+            <a
+              id="export-pdf"
+              class="export-link export-link-pdf"
+              href="#"
+            >
+              Экспорт PDF
+            </a>
+          </div>
+        </div>
+    
         <div class="summary">
           <div class="metric metric-test">
             <strong id="metric-participants">0</strong>
             участников
           </div>
-
+    
           <div class="metric metric-test">
             <strong id="metric-completed">0</strong>
             пройдено
           </div>
-
+    
           <div class="metric metric-test">
             <strong id="metric-failed">0</strong>
             не пройдено
           </div>
-
+    
           <div class="metric metric-test">
             <strong id="metric-waiting">0</strong>
             ожидают
           </div>
         </div>
+    
       </div>
     </section>
 
@@ -962,11 +1036,18 @@ const errorMetric =
 const testDashboard =
   document.getElementById('test-dashboard');
 
+const exportXlsx =
+  document.getElementById('export-xlsx');
 
+const exportPdf =
+  document.getElementById('export-pdf');
+  
 function updateTestDashboard() {{
   const templateId = testFilter.value;
 
   if (!templateId) {{
+    exportXlsx.removeAttribute('href');
+    exportPdf.removeAttribute('href');
     testDashboard.classList.add('hidden');
     return;
   }}
@@ -1014,6 +1095,15 @@ function updateTestDashboard() {{
   document.getElementById(
     'metric-waiting'
   ).textContent = waiting;
+
+  const encodedTemplateId =
+    encodeURIComponent(templateId);
+
+  exportXlsx.href =
+    `/api/reports/${{encodedTemplateId}}/xlsx`;
+
+  exportPdf.href =
+    `/api/reports/${{encodedTemplateId}}/pdf`;
 
   testDashboard.classList.remove('hidden');
 }}

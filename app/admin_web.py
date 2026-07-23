@@ -28,6 +28,16 @@ from .identity import (
 from .logic import rebuild_report
 from .settings import Settings, load_settings
 
+from .report_export import (
+    PDF_MEDIA_TYPE,
+    XLSX_MEDIA_TYPE,
+    build_pdf,
+    build_test_export_report,
+    build_xlsx,
+    download_headers,
+    export_filename,
+)
+
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 security = HTTPBasic(auto_error=False)
@@ -89,6 +99,19 @@ class ConfirmRequest(BaseModel):
 class LoginOverrideRequest(BaseModel):
     email: str
     login: str
+
+
+def find_report_template(
+    template_id: str,
+) -> dict:
+    for template in settings().templates:
+        if str(template.get("id")) == template_id:
+            return template
+
+    raise HTTPException(
+        status_code=404,
+        detail="Шаблон теста не найден",
+    )
 
 
 @app.exception_handler(AudienceImportError)
@@ -200,6 +223,67 @@ def download_issues(import_id: int, _: Annotated[str, Depends(require_admin)]):
         io.BytesIO(content),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers,
+    )
+
+@app.get(
+    "/api/reports/{template_id}/xlsx"
+)
+def download_test_report_xlsx(
+    template_id: str,
+):
+    template = find_report_template(
+        template_id
+    )
+
+    report = build_test_export_report(
+        database(),
+        template,
+    )
+
+    content = build_xlsx(report)
+
+    filename = export_filename(
+        report,
+        "xlsx",
+    )
+
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=XLSX_MEDIA_TYPE,
+        headers=download_headers(
+            filename
+        ),
+    )
+
+
+@app.get(
+    "/api/reports/{template_id}/pdf"
+)
+def download_test_report_pdf(
+    template_id: str,
+):
+    template = find_report_template(
+        template_id
+    )
+
+    report = build_test_export_report(
+        database(),
+        template,
+    )
+
+    content = build_pdf(report)
+
+    filename = export_filename(
+        report,
+        "pdf",
+    )
+
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=PDF_MEDIA_TYPE,
+        headers=download_headers(
+            filename
+        ),
     )
 
 

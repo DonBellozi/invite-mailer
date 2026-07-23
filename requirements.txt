@@ -5,4 +5,6 @@ openpyxl==3.1.5
 psycopg2-binary==2.9.10
 python-multipart==0.0.20
 PyYAML==6.0.2
+reportlab==5.0.0
+ttf-opensans==2020.10.30
 uvicorn==0.34.0
