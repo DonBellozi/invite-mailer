@@ -1,45 +1,47 @@
 x-app-environment: &app-environment
-  TZ: "${TZ:-Europe/Moscow}"
+  TZ: "${TZ}"
 
   IMAP_HOST: "${IMAP_HOST}"
-  IMAP_PORT: "${IMAP_PORT:-993}"
-  IMAP_SSL: "${IMAP_SSL:-true}"
+  IMAP_PORT: "${IMAP_PORT}"
+  IMAP_SSL: "${IMAP_SSL}"
   IMAP_USERNAME: "${IMAP_USERNAME}"
   IMAP_PASSWORD: "${IMAP_PASSWORD}"
-  IMAP_FOLDER: "${IMAP_FOLDER:-INBOX}"
-  IMAP_FROM_CONTAINS: "${IMAP_FROM_CONTAINS:-1c-robot@}"
-  IMAP_LOOKBACK_DAYS: "${IMAP_LOOKBACK_DAYS:-3}"
+  IMAP_FOLDER: "${IMAP_FOLDER}"
+  IMAP_FROM_CONTAINS: "${IMAP_FROM_CONTAINS}"
+  IMAP_LOOKBACK_DAYS: "${IMAP_LOOKBACK_DAYS}"
 
   SMTP_HOST: "${SMTP_HOST}"
-  SMTP_PORT: "${SMTP_PORT:-465}"
-  SMTP_MODE: "${SMTP_MODE:-ssl}"
+  SMTP_PORT: "${SMTP_PORT}"
+  SMTP_MODE: "${SMTP_MODE}"
   SMTP_USERNAME: "${SMTP_USERNAME}"
   SMTP_PASSWORD: "${SMTP_PASSWORD}"
   SMTP_FROM_EMAIL: "${SMTP_FROM_EMAIL}"
-  SMTP_FROM_NAME: "${SMTP_FROM_NAME:-Система тестирования}"
+  SMTP_FROM_NAME: "${SMTP_FROM_NAME}"
 
   WORKER_HASH_SECRET: "${WORKER_HASH_SECRET}"
 
   # Прежний JSON используется только как источник первоначального переноса
   # в раздел админки «Сопоставление логинов».
-  LOGIN_OVERRIDES_JSON: "${LOGIN_OVERRIDES_JSON:-}"
+  LOGIN_OVERRIDES_JSON: "${LOGIN_OVERRIDES_JSON}"
 
-  INDIGO_ENABLED: "${INDIGO_ENABLED:-false}"
-  INDIGO_DB_HOST: "${INDIGO_DB_HOST:-10.0.10.16}"
-  INDIGO_DB_PORT: "${INDIGO_DB_PORT:-5436}"
-  INDIGO_DB_NAME: "${INDIGO_DB_NAME:-}"
-  INDIGO_DB_USER: "${INDIGO_DB_USER:-}"
-  INDIGO_DB_PASSWORD: "${INDIGO_DB_PASSWORD:-}"
-  INDIGO_DB_SSLMODE: "${INDIGO_DB_SSLMODE:-prefer}"
-  INDIGO_DB_CONNECT_TIMEOUT: "${INDIGO_DB_CONNECT_TIMEOUT:-5}"
+  # Все параметры PostgreSQL Indigo задаются только во внешнем окружении:
+  # в .env при обычном Docker Compose или в Environment variables стека Portainer.
+  INDIGO_ENABLED: "${INDIGO_ENABLED}"
+  INDIGO_DB_HOST: "${INDIGO_DB_HOST}"
+  INDIGO_DB_PORT: "${INDIGO_DB_PORT}"
+  INDIGO_DB_NAME: "${INDIGO_DB_NAME}"
+  INDIGO_DB_USER: "${INDIGO_DB_USER}"
+  INDIGO_DB_PASSWORD: "${INDIGO_DB_PASSWORD}"
+  INDIGO_DB_SSLMODE: "${INDIGO_DB_SSLMODE}"
+  INDIGO_DB_CONNECT_TIMEOUT: "${INDIGO_DB_CONNECT_TIMEOUT}"
 
-  ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
-  ADMIN_PASSWORD: "${ADMIN_PASSWORD:-roskapstroy}"
+  ADMIN_USERNAME: "${ADMIN_USERNAME}"
+  ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
 
 x-app-volumes: &app-volumes
-  - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/data:/opt/invite-mailer/data"
-  - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/state:/opt/invite-mailer/state"
-  - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/reports:/opt/invite-mailer/reports"
+  - "${STORAGE_ROOT}/data:/opt/invite-mailer/data"
+  - "${STORAGE_ROOT}/state:/opt/invite-mailer/state"
+  - "${STORAGE_ROOT}/reports:/opt/invite-mailer/reports"
 
 services:
   invite-mailer:
@@ -71,9 +73,9 @@ services:
       - invite-mailer
       - invite-mailer-admin
     ports:
-      - "${REPORT_BIND_IP:-0.0.0.0}:${REPORT_PORT:-8080}:80"
+      - "${REPORT_BIND_IP}:${REPORT_PORT}:80"
     volumes:
-      - "${STORAGE_ROOT:-/opt/invite-mailer-storage}/reports:/usr/share/nginx/html:ro"
+      - "${STORAGE_ROOT}/reports:/usr/share/nginx/html:ro"
     networks:
       - invite-mailer-net
 
