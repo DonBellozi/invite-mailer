@@ -1,5 +1,5 @@
 templates:
-# Антитеррор
+  # Антитеррор – все действующие сотрудники
   - id: "antiterror"
     enabled: true
     name: "Антитеррор"
@@ -13,7 +13,16 @@ templates:
         - "*"
       exclude: []
 
-# Антикоррупция
+    indigo:
+      logical_test_id: 1715
+      test_name: "Антитеррор"
+      success_results:
+        - "Отлично"
+        - "Хорошо"
+      failed_result_prefixes:
+        - "Требуется повторный"
+
+  # Антикоррупция – выборочный список участников
   - id: "anticorruption"
     enabled: true
     name: "Антикоррупция"
@@ -21,5 +30,15 @@ templates:
     body_template: "/opt/invite-mailer/templates/anticorruption.html"
     mode: "once"
     validity_days: null
+
     audience:
       type: "explicit_list"
+
+    indigo:
+      logical_test_id: 1719
+      test_name: "Антикоррупция"
+      success_results:
+        - "Отлично"
+        - "Хорошо"
+      failed_result_prefixes:
+        - "Требуется повторный"

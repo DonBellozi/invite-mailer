@@ -25,10 +25,11 @@ def _bool_env(name: str, default: bool) -> bool:
 
 
 def _load_login_overrides(config: dict[str, Any]) -> dict[str, str]:
-    """Загружает исключения из YAML и дополняет их значениями из Portainer.
+    """Загружает прежние исключения для однократного переноса в SQLite.
 
-    LOGIN_OVERRIDES_JSON имеет приоритет над YAML и должен содержать объект:
-    {"email@domain.ru": "ad_login"}
+    После обновления основным источником становится таблица login_overrides.
+    YAML и LOGIN_OVERRIDES_JSON сохранены для обратной совместимости и
+    импортируются только для отсутствующих записей.
     """
     overrides: dict[str, str] = {}
 
@@ -40,7 +41,7 @@ def _load_login_overrides(config: dict[str, Any]) -> dict[str, str]:
         overrides_data = _read_yaml(overrides_file)
         for item in overrides_data.get("overrides", []):
             email = str(item.get("email", "")).strip().lower()
-            login = str(item.get("login", "")).strip()
+            login = str(item.get("login", "")).strip().lower()
             if email and login:
                 overrides[email] = login
 
@@ -64,11 +65,9 @@ def _load_login_overrides(config: dict[str, Any]) -> dict[str, str]:
 
     for email_address, login_value in environment_overrides.items():
         email = str(email_address).strip().lower()
-        login = str(login_value).strip()
+        login = str(login_value).strip().lower()
         if not email or not login:
-            raise RuntimeError(
-                "LOGIN_OVERRIDES_JSON содержит пустой email или логин"
-            )
+            raise RuntimeError("LOGIN_OVERRIDES_JSON содержит пустой email или логин")
         overrides[email] = login
 
     return overrides
@@ -98,12 +97,44 @@ class SmtpSettings:
 
 
 @dataclass(frozen=True)
+class IndigoSettings:
+    enabled: bool
+    host: str
+    port: int
+    database: str
+    username: str
+    password: str
+    sslmode: str
+    connect_timeout: int
+    view: str
+
+    def validate(self) -> None:
+        if not self.enabled:
+            return
+        missing = [
+            name
+            for name, value in {
+                "INDIGO_DB_HOST": self.host,
+                "INDIGO_DB_NAME": self.database,
+                "INDIGO_DB_USER": self.username,
+                "INDIGO_DB_PASSWORD": self.password,
+            }.items()
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(
+                "Для подключения к Indigo не заданы: " + ", ".join(missing)
+            )
+
+
+@dataclass(frozen=True)
 class Settings:
     config: dict[str, Any]
     templates: list[dict[str, Any]]
     login_overrides: dict[str, str]
     imap: ImapSettings
     smtp: SmtpSettings
+    indigo: IndigoSettings
     worker_hash_secret: str
 
     @property
@@ -148,6 +179,33 @@ def load_settings() -> Settings:
         from_name=os.getenv("SMTP_FROM_NAME", "Система тестирования"),
     )
 
+    indigo_config = config.get("indigo", {})
+    indigo = IndigoSettings(
+        enabled=_bool_env("INDIGO_ENABLED", bool(indigo_config.get("enabled", False))),
+        host=os.getenv("INDIGO_DB_HOST", str(indigo_config.get("host", ""))).strip(),
+        port=int(os.getenv("INDIGO_DB_PORT", str(indigo_config.get("port", 5432)))),
+        database=os.getenv(
+            "INDIGO_DB_NAME", str(indigo_config.get("database", ""))
+        ).strip(),
+        username=os.getenv(
+            "INDIGO_DB_USER", str(indigo_config.get("username", ""))
+        ).strip(),
+        password=os.getenv(
+            "INDIGO_DB_PASSWORD", str(indigo_config.get("password", ""))
+        ),
+        sslmode=os.getenv(
+            "INDIGO_DB_SSLMODE", str(indigo_config.get("sslmode", "prefer"))
+        ).strip(),
+        connect_timeout=int(
+            os.getenv(
+                "INDIGO_DB_CONNECT_TIMEOUT",
+                str(indigo_config.get("connect_timeout", 5)),
+            )
+        ),
+        view=str(indigo_config.get("view", "res.results_view")).strip(),
+    )
+    indigo.validate()
+
     secret = os.getenv("WORKER_HASH_SECRET", "")
     if len(secret) < 16:
         raise RuntimeError("WORKER_HASH_SECRET должен содержать не менее 16 символов")
@@ -158,5 +216,6 @@ def load_settings() -> Settings:
         login_overrides=overrides,
         imap=imap,
         smtp=smtp,
+        indigo=indigo,
         worker_hash_secret=secret,
     )

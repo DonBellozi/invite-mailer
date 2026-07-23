@@ -48,12 +48,15 @@ alerts:
   enabled: false
   recipients: []
 
-# Модуль INDIGO пока отключен. При enabled=false подключение к PostgreSQL не выполняется.
+# Результаты INDIGO читаются только при INDIGO_ENABLED=true.
+# Реквизиты подключения задаются в переменных окружения Portainer.
 indigo:
   enabled: false
   host: ""
-  port: 5432
+  port: 5436
   database: ""
   username: ""
   password: ""
+  sslmode: "prefer"
+  connect_timeout: 5
   view: "res.results_view"

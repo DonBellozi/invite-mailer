@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import logging
 import shutil
 import time
 from datetime import datetime, timedelta
@@ -10,11 +11,16 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from .audience import is_explicit_template
 from .db import Database
+from .identity import get_login_overrides
 from .imap_source import fetch_latest_attachment
+from .indigo import summarize_employee_result, try_sync_indigo_results
 from .mailer import send_html_email
 from .report import build_report
 from .settings import Settings
 from .xlsx_parser import EmployeeRecord, parse_xlsx
+
+
+LOGGER = logging.getLogger("invite-mailer.logic")
 
 
 def now_iso() -> str:
@@ -60,7 +66,9 @@ def _candidate_employees(connection, template: dict):
 
 
 def _is_due(connection, employee, template: dict, now: datetime) -> bool:
-    latest = connection.execute(
+    result = summarize_employee_result(connection, employee, template, now=now)
+
+    latest_sent = connection.execute(
         """
         SELECT * FROM notification_history
         WHERE worker_key = ? AND employment_seq = ? AND template_id = ? AND status = 'sent'
@@ -69,16 +77,35 @@ def _is_due(connection, employee, template: dict, now: datetime) -> bool:
         (employee["worker_key"], employee["employment_seq"], template["id"]),
     ).fetchone()
 
-    if latest is None:
-        return True
     if template.get("mode", "once") == "once":
-        return False
+        # Уже пройденный разовый тест повторно не рассылаем, даже если запись
+        # о старой ручной рассылке отсутствует.
+        if result.status == "completed":
+            return False
+        return latest_sent is None
 
     validity_days = int(template.get("validity_days") or 0)
     if validity_days <= 0:
         raise ValueError(f"У периодического шаблона {template['id']} не задан validity_days")
-    last_sent = datetime.fromisoformat(latest["sent_at"])
-    return last_sent + timedelta(days=validity_days) <= now
+
+    # Действующий успешный результат блокирует новое уведомление. Любая новая
+    # успешная попытка, в том числе добровольная, переносит next_due_at вперед.
+    if result.status == "completed":
+        return False
+
+    if result.next_due_at:
+        cycle_start = datetime.fromisoformat(result.next_due_at)
+        if now < cycle_start:
+            return False
+        # В новом цикле отправляем одно основное приглашение. Повторные
+        # напоминания будут отдельным механизмом.
+        if latest_sent and datetime.fromisoformat(latest_sent["sent_at"]) >= cycle_start:
+            return False
+        return True
+
+    # Периодический тест еще ни разу не пройден: первое приглашение отправляется
+    # один раз, затем ожидается результат.
+    return latest_sent is None
 
 
 def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_imports: int) -> None:
@@ -98,9 +125,9 @@ def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_
                     """
                     INSERT INTO employees(
                         worker_key, fio, email, login, department, position,
-                        active, employment_seq, first_seen_at, last_seen_at,
+                        active, employment_seq, first_seen_at, employment_started_at, last_seen_at,
                         missed_imports, inactive_since, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 0, NULL, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, 0, NULL, ?)
                     """,
                     (
                         record.worker_key,
@@ -112,19 +139,22 @@ def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_
                         timestamp,
                         timestamp,
                         timestamp,
+                        timestamp,
                     ),
                 )
                 continue
 
             employment_seq = existing["employment_seq"]
+            employment_started_at = existing["employment_started_at"] or existing["first_seen_at"]
             if not existing["active"]:
                 employment_seq += 1
+                employment_started_at = timestamp
 
             connection.execute(
                 """
                 UPDATE employees SET
                     fio = ?, email = ?, login = ?, department = ?, position = ?,
-                    active = 1, employment_seq = ?, last_seen_at = ?,
+                    active = 1, employment_seq = ?, employment_started_at = ?, last_seen_at = ?,
                     missed_imports = 0, inactive_since = NULL, updated_at = ?
                 WHERE worker_key = ?
                 """,
@@ -135,6 +165,7 @@ def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_
                     record.department,
                     record.position,
                     employment_seq,
+                    employment_started_at,
                     timestamp,
                     timestamp,
                     record.worker_key,
@@ -161,7 +192,7 @@ def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_
                 )
 
 
-def _parse_employee_file(settings: Settings, path: Path) -> list[EmployeeRecord]:
+def _parse_employee_file(settings: Settings, db: Database, path: Path) -> list[EmployeeRecord]:
     source = settings.config["source"]
     xlsx_cfg = settings.config["xlsx"]
     return parse_xlsx(
@@ -169,7 +200,7 @@ def _parse_employee_file(settings: Settings, path: Path) -> list[EmployeeRecord]
         xlsx_cfg["columns"],
         int(xlsx_cfg.get("header_search_rows", 20)),
         settings.worker_hash_secret,
-        settings.login_overrides,
+        get_login_overrides(db),
         sheet_name=source.get("sheet_name"),
         lowercase_login=bool(settings.config.get("identity", {}).get("lowercase", True)),
     )
@@ -196,11 +227,11 @@ def fetch_and_import(settings: Settings, db: Database) -> Path:
         if not current_file.exists():
             shutil.copy2(result.saved_path, current_file)
         # Даже для уже обработанного XLSX заново применяем LOGIN_OVERRIDES_JSON.
-        records = _parse_employee_file(settings, current_file)
+        records = _parse_employee_file(settings, db, current_file)
         import_employees(db, records, int(source.get("absence_grace_imports", 1)))
         return current_file
 
-    records = _parse_employee_file(settings, result.saved_path)
+    records = _parse_employee_file(settings, db, result.saved_path)
 
     min_employees = int(source.get("min_employees", 1))
     if len(records) < min_employees:
@@ -248,6 +279,7 @@ def fetch_and_import(settings: Settings, db: Database) -> Path:
 
 
 def send_notifications(settings: Settings, db: Database, dry_run: bool = False) -> dict:
+    try_sync_indigo_results(settings, db)
     start = datetime.now()
     environment = Environment(
         loader=FileSystemLoader("/"),
@@ -420,13 +452,16 @@ def seed_manual(settings: Settings, db: Database, template_ids: list[str], sent_
     return count
 
 
-def rebuild_report(settings: Settings, db: Database) -> Path:
+def rebuild_report(settings: Settings, db: Database, sync_indigo: bool = True) -> Path:
+    if sync_indigo:
+        try_sync_indigo_results(settings, db)
     output = settings.reports_path / "index.html"
     build_report(
         db,
         settings.templates,
         settings.config.get("report", {}).get("title", "Отчет"),
         output,
+        indigo_enabled=settings.indigo.enabled,
     )
     return output
 
@@ -434,5 +469,5 @@ def rebuild_report(settings: Settings, db: Database) -> Path:
 def run_full(settings: Settings, db: Database, dry_run: bool = False) -> dict:
     fetch_and_import(settings, db)
     summary = send_notifications(settings, db, dry_run=dry_run)
-    rebuild_report(settings, db)
+    rebuild_report(settings, db, sync_indigo=False)
     return summary

@@ -10,6 +10,8 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from .db import Database
+from .identity import bootstrap_legacy_overrides
+from .indigo import sync_indigo_results
 from .logic import (
     fetch_and_import,
     rebuild_report,
@@ -34,6 +36,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("scheduler")
     commands.add_parser("fetch")
     commands.add_parser("report")
+    commands.add_parser("indigo-sync")
 
     run = commands.add_parser("run")
     run.add_argument("--dry-run", action="store_true")
@@ -99,6 +102,7 @@ def main() -> int:
     args = parser().parse_args()
     settings = load_settings()
     db = Database(settings.database_path)
+    bootstrap_legacy_overrides(settings, db)
 
     if args.command == "scheduler":
         scheduler_mode(settings, db)
@@ -114,10 +118,16 @@ def main() -> int:
         print(rebuild_report(settings, db))
         return 0
 
+    if args.command == "indigo-sync":
+        count = sync_indigo_results(settings, db)
+        rebuild_report(settings, db, sync_indigo=False)
+        print(f"Загружено результатов Indigo: {count}")
+        return 0
+
     if args.command == "run":
         if args.skip_fetch:
             summary = send_notifications(settings, db, dry_run=args.dry_run)
-            rebuild_report(settings, db)
+            rebuild_report(settings, db, sync_indigo=False)
         else:
             summary = run_full(settings, db, dry_run=args.dry_run)
         print(json.dumps(summary, ensure_ascii=False, indent=2))

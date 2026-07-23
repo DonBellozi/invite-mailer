@@ -19,6 +19,12 @@ from .audience import (
     get_preview,
 )
 from .db import Database
+from .identity import (
+    bootstrap_legacy_overrides,
+    delete_override,
+    list_overrides,
+    save_override,
+)
 from .logic import rebuild_report
 from .settings import Settings, load_settings
 
@@ -42,6 +48,7 @@ def database() -> Database:
     global _db
     if _db is None:
         _db = Database(settings().database_path)
+        bootstrap_legacy_overrides(settings(), _db)
     return _db
 
 
@@ -79,6 +86,11 @@ class ConfirmRequest(BaseModel):
     row_ids: list[int]
 
 
+class LoginOverrideRequest(BaseModel):
+    email: str
+    login: str
+
+
 @app.exception_handler(AudienceImportError)
 async def audience_error_handler(_, error: AudienceImportError):
     return JSONResponse(
@@ -90,6 +102,42 @@ async def audience_error_handler(_, error: AudienceImportError):
 @app.get("/admin/", response_class=HTMLResponse)
 def admin_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return ADMIN_HTML
+
+
+@app.get("/admin/logins/", response_class=HTMLResponse)
+def login_overrides_page(_: Annotated[str, Depends(require_admin)]) -> str:
+    return LOGIN_OVERRIDES_HTML
+
+
+@app.get("/api/login-overrides")
+def read_login_overrides(_: Annotated[str, Depends(require_admin)]):
+    return {"items": list_overrides(database())}
+
+
+@app.post("/api/login-overrides")
+def write_login_override(
+    request: LoginOverrideRequest,
+    _: Annotated[str, Depends(require_admin)],
+):
+    try:
+        item = save_override(database(), request.email, request.login)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    rebuild_report(settings(), database(), sync_indigo=False)
+    return item
+
+
+@app.delete("/api/login-overrides/{email}")
+def remove_login_override(
+    email: str,
+    _: Annotated[str, Depends(require_admin)],
+):
+    try:
+        deleted = delete_override(database(), email)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    rebuild_report(settings(), database(), sync_indigo=False)
+    return {"deleted": deleted}
 
 
 @app.get("/api/audience/templates")
@@ -138,7 +186,7 @@ def confirm_import(
     _: Annotated[str, Depends(require_admin)],
 ):
     result = confirm_preview(database(), import_id, request.row_ids)
-    rebuild_report(settings(), database())
+    rebuild_report(settings(), database(), sync_indigo=False)
     return result
 
 
@@ -159,6 +207,149 @@ def download_issues(import_id: int, _: Annotated[str, Depends(require_admin)]):
 def health():
     database()
     return {"status": "ok"}
+
+
+LOGIN_OVERRIDES_HTML = r"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сопоставление e-mail и логина</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 24px; color: #222; background: #f5f6f8; }
+.card { background: #fff; border-radius: 10px; padding: 18px; margin-bottom: 18px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+.header-line { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+h1 { margin: 0 0 8px; font-size: 24px; }
+h2 { margin-top: 0; font-size: 18px; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.back-link { display: inline-block; padding: 9px 13px; border: 1px solid #98a2b3; border-radius: 7px; color: #344054; text-decoration: none; font-size: 13px; font-weight: 600; background: #fff; }
+.form-grid { display: grid; grid-template-columns: minmax(280px, 2fr) minmax(220px, 1fr) auto; gap: 12px; align-items: end; }
+label { display: block; margin-bottom: 5px; color: #475467; font-size: 12px; font-weight: 600; }
+input, button { box-sizing: border-box; padding: 10px; border-radius: 6px; font: inherit; }
+input { width: 100%; border: 1px solid #ccd2da; background: #fff; }
+button { border: 0; background: #175cd3; color: #fff; font-weight: 600; cursor: pointer; }
+button:hover { background: #1849a9; }
+button.danger { background: #fff; color: #b42318; border: 1px solid #f04438; padding: 7px 10px; }
+button.danger:hover { background: #fef3f2; }
+.filters { display: flex; gap: 12px; margin: 12px 0; }
+.table-wrap { overflow: auto; border: 1px solid #eaecf0; border-radius: 8px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 9px 8px; border-bottom: 1px solid #e1e5ea; text-align: left; vertical-align: middle; }
+th { background: #f0f2f5; }
+.small { color: #667085; font-size: 12px; }
+.message { margin-top: 12px; padding: 12px; border-radius: 7px; display: none; }
+.message.error { display: block; background: #fef3f2; color: #912018; }
+.message.success { display: block; background: #ecfdf3; color: #05603a; }
+@media (max-width: 850px) { .form-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="header-line">
+    <div>
+      <h1>Сопоставление e-mail и логина</h1>
+      <div class="small">Используется только для работников, у которых логин Indigo не совпадает с частью e-mail до знака @. Изменения применяются сразу.</div>
+    </div>
+    <div class="actions">
+      <a class="back-link" href="/admin/">Импорт участников</a>
+      <a class="back-link" href="/">Вернуться к отчету</a>
+    </div>
+  </div>
+</div>
+<div class="card">
+  <h2>Добавить или изменить сопоставление</h2>
+  <form id="mapping-form" class="form-grid">
+    <div>
+      <label for="email">E-mail сотрудника</label>
+      <input id="email" name="email" type="email" required placeholder="petrov.pp@example.ru">
+    </div>
+    <div>
+      <label for="login">Логин Indigo</label>
+      <input id="login" name="login" required placeholder="petrov.p">
+    </div>
+    <button type="submit">Сохранить</button>
+  </form>
+  <div id="message" class="message"></div>
+</div>
+<div class="card">
+  <h2>Действующие сопоставления</h2>
+  <div class="filters">
+    <input id="search" type="search" placeholder="Поиск по e-mail, логину или ФИО">
+  </div>
+  <p id="count" class="small"></p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>E-mail</th><th>Логин Indigo</th><th>Сотрудник</th><th>Изменено</th><th></th></tr></thead>
+      <tbody id="mapping-body"></tbody>
+    </table>
+  </div>
+</div>
+<script>
+let items = [];
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+}
+async function api(url, options = {}) {
+  const response = await fetch(url, options);
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+  return payload;
+}
+function showMessage(text, kind) {
+  const node = document.getElementById('message');
+  node.textContent = text;
+  node.className = `message ${kind}`;
+}
+function formatDate(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('ru-RU');
+}
+function render() {
+  const query = document.getElementById('search').value.trim().toLowerCase();
+  const filtered = items.filter(item => !query || [item.email, item.login, item.fio].join(' ').toLowerCase().includes(query));
+  document.getElementById('count').textContent = `Показано сопоставлений: ${filtered.length}`;
+  document.getElementById('mapping-body').innerHTML = filtered.map(item => `
+    <tr>
+      <td>${escapeHtml(item.email)}</td>
+      <td>${escapeHtml(item.login)}</td>
+      <td>${escapeHtml(item.fio || 'Не найден в текущей базе')}${item.fio && item.active === false ? '<div class="small">Сотрудник неактивен</div>' : ''}</td>
+      <td>${escapeHtml(formatDate(item.updated_at))}</td>
+      <td><button class="danger" type="button" data-email="${escapeHtml(item.email)}">Удалить</button></td>
+    </tr>`).join('');
+  document.querySelectorAll('button[data-email]').forEach(button => button.addEventListener('click', async () => {
+    if (!confirm(`Удалить сопоставление для ${button.dataset.email}?`)) return;
+    try {
+      await api(`/api/login-overrides/${encodeURIComponent(button.dataset.email)}`, {method: 'DELETE'});
+      await load();
+      showMessage('Сопоставление удалено. Для сотрудника снова используется часть e-mail до знака @.', 'success');
+    } catch (error) { showMessage(error.message, 'error'); }
+  }));
+}
+async function load() {
+  const payload = await api('/api/login-overrides');
+  items = payload.items;
+  render();
+}
+document.getElementById('mapping-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const data = new FormData(event.target);
+  try {
+    const item = await api('/api/login-overrides', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email: data.get('email'), login: data.get('login')})
+    });
+    event.target.reset();
+    await load();
+    showMessage(item.fio ? `Сопоставление сохранено для: ${item.fio}` : 'Сопоставление сохранено. Сотрудник с таким e-mail пока не найден в текущей базе.', 'success');
+  } catch (error) { showMessage(error.message, 'error'); }
+});
+document.getElementById('search').addEventListener('input', render);
+load().catch(error => showMessage(error.message, 'error'));
+</script>
+</body>
+</html>"""
 
 
 ADMIN_HTML = r"""<!doctype html>
@@ -214,7 +405,10 @@ tr.error { background: #fff5f5; }
       <h1>Импорт списков участников</h1>
       <div class="small">Файл используется только для отбора по email. ФИО, подразделение, должность и логин берутся из основной ежедневной базы.</div>
     </div>
-    <a class="back-link" href="/">Вернуться к отчету</a>
+    <div class="actions">
+      <a class="back-link" href="/admin/logins/">Сопоставление логинов</a>
+      <a class="back-link" href="/">Вернуться к отчету</a>
+    </div>
   </div>
 </div>
 

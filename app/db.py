@@ -35,11 +35,18 @@ CREATE TABLE IF NOT EXISTS employees (
     active INTEGER NOT NULL DEFAULT 1,
     employment_seq INTEGER NOT NULL DEFAULT 1,
     first_seen_at TEXT NOT NULL,
+    employment_started_at TEXT,
     last_seen_at TEXT NOT NULL,
     missed_imports INTEGER NOT NULL DEFAULT 0,
     inactive_since TEXT,
     updated_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_employees_email
+ON employees(email, active);
+
+CREATE INDEX IF NOT EXISTS idx_employees_login
+ON employees(login, active);
 
 CREATE TABLE IF NOT EXISTS notification_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,7 +77,6 @@ CREATE TABLE IF NOT EXISTS app_state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
-
 
 CREATE TABLE IF NOT EXISTS audience_imports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,6 +138,45 @@ CREATE TABLE IF NOT EXISTS test_assignments (
 
 CREATE INDEX IF NOT EXISTS idx_test_assignments_lookup
 ON test_assignments(template_id, active, worker_key, employment_seq);
+
+CREATE TABLE IF NOT EXISTS login_overrides (
+    email TEXT PRIMARY KEY,
+    login TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'admin',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_login_overrides_login
+ON login_overrides(login);
+
+CREATE TABLE IF NOT EXISTS indigo_attempts (
+    result_id INTEGER PRIMARY KEY,
+    login TEXT NOT NULL,
+    logical_test_id INTEGER NOT NULL,
+    source_test_id INTEGER NOT NULL,
+    ph_test_id INTEGER,
+    test_name TEXT NOT NULL,
+    source_status INTEGER,
+    time_start TEXT,
+    time_end TEXT,
+    percent REAL,
+    source_result TEXT,
+    archived INTEGER NOT NULL DEFAULT 0,
+    synced_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_indigo_attempt_lookup
+ON indigo_attempts(logical_test_id, login, time_end);
+
+CREATE TABLE IF NOT EXISTS indigo_sync_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    rows_loaded INTEGER NOT NULL DEFAULT 0,
+    error_text TEXT
+);
 """
 
 
@@ -141,6 +186,27 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+
+    @staticmethod
+    def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+        return {
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        employee_columns = self._column_names(connection, "employees")
+        if "employment_started_at" not in employee_columns:
+            connection.execute("ALTER TABLE employees ADD COLUMN employment_started_at TEXT")
+
+        connection.execute(
+            """
+            UPDATE employees
+            SET employment_started_at = first_seen_at
+            WHERE employment_started_at IS NULL OR employment_started_at = ''
+            """
+        )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
