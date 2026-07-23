@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 from datetime import datetime
+from sched import scheduler
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -69,6 +70,41 @@ def scheduler_mode(settings, db: Database) -> None:
         except Exception:
             LOGGER.exception("Ошибка еженедельной рассылки")
 
+    def indigo_job():
+        try:
+            count = sync_indigo_results(
+                settings,
+                db,
+            )
+
+            LOGGER.info(
+                "Результаты Indigo обновлены: %s",
+                count,
+            )
+
+        except Exception:
+            LOGGER.exception(
+                "Ошибка обновления результатов Indigo"
+            )
+
+        finally:
+            try:
+                rebuild_report(
+                    settings,
+                    db,
+                    sync_indigo=False,
+                )
+
+                LOGGER.info(
+                    "HTML-отчет обновлен после синхронизации Indigo"
+                )
+
+            except Exception:
+                LOGGER.exception(
+                    "Не удалось обновить HTML-отчет"
+                )
+
+
     scheduler.add_job(
         fetch_job,
         CronTrigger(
@@ -91,6 +127,18 @@ def scheduler_mode(settings, db: Database) -> None:
         id="weekly_send",
         replace_existing=True,
         max_instances=1,
+    )
+
+    scheduler.add_job(
+        indigo_job,
+        CronTrigger(
+            minute=15,
+            timezone=timezone,
+        ),
+        id="hourly_indigo_sync",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
 
     rebuild_report(settings, db)
