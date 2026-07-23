@@ -37,7 +37,11 @@ from .report_export import (
     download_headers,
     export_filename,
 )
-
+from .audience_template import (
+    TEMPLATE_MEDIA_TYPE,
+    build_audience_template,
+    template_download_headers,
+)
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 security = HTTPBasic(auto_error=False)
@@ -287,6 +291,19 @@ def download_test_report_pdf(
     )
 
 
+@app.get("/api/audience/template.xlsx")
+def download_audience_template(
+    _: Annotated[str, Depends(require_admin)],
+):
+    content = build_audience_template()
+
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=TEMPLATE_MEDIA_TYPE,
+        headers=template_download_headers(),
+    )
+
+
 @app.get("/api/health")
 def health():
     database()
@@ -302,6 +319,87 @@ LOGIN_OVERRIDES_HTML = r"""<!doctype html>
 <style>
 body { font-family: Arial, sans-serif; margin: 24px; color: #222; background: #f5f6f8; }
 .card { background: #fff; border-radius: 10px; padding: 18px; margin-bottom: 18px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+.page-header {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+
+.page-header-main {
+  flex: 1 1 auto;
+  min-width: 360px;
+  padding-right: 18px;
+  box-sizing: border-box;
+}
+
+.page-header-template {
+  flex: 0 0 190px;
+  min-width: 190px;
+  padding: 0 18px;
+  border-left: 2px solid #e5e7eb;
+  box-sizing: border-box;
+}
+
+.page-header-actions {
+  flex: 0 0 190px;
+  min-width: 190px;
+  padding-left: 18px;
+  border-left: 2px solid #e5e7eb;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-sizing: border-box;
+}
+
+.header-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 38px;
+  box-sizing: border-box;
+  padding: 9px 13px;
+  border: 1px solid #98a2b3;
+  border-radius: 7px;
+  color: #344054;
+  text-decoration: none;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  background: #fff;
+}
+
+.header-button:hover {
+  background: #f2f4f7;
+}
+
+.template-button:hover {
+  color: #176b36;
+  border-color: #32a852;
+  background: #f0fdf4;
+}
+
+@media (max-width: 900px) {
+  .page-header {
+    flex-wrap: wrap;
+    gap: 14px;
+  }
+
+  .page-header-main {
+    flex: 1 1 100%;
+    min-width: 100%;
+    padding-right: 0;
+  }
+
+  .page-header-template,
+  .page-header-actions {
+    flex: 1 1 220px;
+    min-width: 220px;
+    padding: 14px 0 0;
+    border-left: 0;
+    border-top: 2px solid #e5e7eb;
+  }
+}
 .header-line { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 h1 { margin: 0 0 8px; font-size: 24px; }
 h2 { margin-top: 0; font-size: 18px; }
@@ -445,6 +543,87 @@ ADMIN_HTML = r"""<!doctype html>
 <style>
 body { font-family: Arial, sans-serif; margin: 24px; color: #222; background: #f5f6f8; }
 .card { background: #fff; border-radius: 10px; padding: 18px; margin-bottom: 18px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+.page-header {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+
+.page-header-main {
+  flex: 1 1 auto;
+  min-width: 360px;
+  padding-right: 18px;
+  box-sizing: border-box;
+}
+
+.page-header-template {
+  flex: 0 0 190px;
+  min-width: 190px;
+  padding: 0 18px;
+  border-left: 2px solid #e5e7eb;
+  box-sizing: border-box;
+}
+
+.page-header-actions {
+  flex: 0 0 190px;
+  min-width: 190px;
+  padding-left: 18px;
+  border-left: 2px solid #e5e7eb;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-sizing: border-box;
+}
+
+.header-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 38px;
+  box-sizing: border-box;
+  padding: 9px 13px;
+  border: 1px solid #98a2b3;
+  border-radius: 7px;
+  color: #344054;
+  text-decoration: none;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  background: #fff;
+}
+
+.header-button:hover {
+  background: #f2f4f7;
+}
+
+.template-button:hover {
+  color: #176b36;
+  border-color: #32a852;
+  background: #f0fdf4;
+}
+
+@media (max-width: 900px) {
+  .page-header {
+    flex-wrap: wrap;
+    gap: 14px;
+  }
+
+  .page-header-main {
+    flex: 1 1 100%;
+    min-width: 100%;
+    padding-right: 0;
+  }
+
+  .page-header-template,
+  .page-header-actions {
+    flex: 1 1 220px;
+    min-width: 220px;
+    padding: 14px 0 0;
+    border-left: 0;
+    border-top: 2px solid #e5e7eb;
+  }
+}
 .header-line { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 h1 { margin: 0 0 8px; font-size: 24px; }
 h2 { margin-top: 0; font-size: 18px; }
