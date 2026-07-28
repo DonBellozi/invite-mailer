@@ -178,6 +178,11 @@ h2.dashboard-title {
   background: #f3f1e5;
 }
 
+.metric-warning {
+  background: #fff8f1;
+  border-color: #f3d6bd;
+}
+
 .metric-button {
   cursor: pointer;
 }
@@ -863,7 +868,7 @@ def build_report(
           всего работников
         </div>
 
-        <div class="metric">
+        <div class="metric{' metric-warning' if missing_email else ''}">
           <strong>{missing_email}</strong>
           без e-mail
         </div>
@@ -1083,9 +1088,13 @@ function updateTestDashboard() {{
     row => row.dataset.status === 'failed'
   ).length;
 
+  const withoutEmail = testRows.filter(
+    row => row.dataset.status === 'no_email'
+  ).length;
+
   const waiting = Math.max(
     0,
-    testRows.length - completed - failed
+    testRows.length - completed - failed - withoutEmail
   );
 
   document.getElementById(
