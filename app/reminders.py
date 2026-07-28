@@ -114,10 +114,12 @@ def _reviewer_body(row, template_name: str) -> str:
 
 def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                                               template_ids: set[str] | None = None) -> dict:
+    """Отправляет контролирующим сводные письма по тесту с несколькими работниками."""
     settings.templates[:] = load_test_definitions(settings, db)
     ensure_mail_templates(db, settings.templates)
     templates = {str(t["id"]): t for t in settings.templates}
     summary = {"delivered": 0, "pending": 0, "errors": 0}
+
     with db.connect() as connection:
         params: list[object] = []
         where = "WHERE q.status = 'pending'"
@@ -125,12 +127,20 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
             placeholders = ",".join("?" for _ in template_ids)
             where += f" AND q.template_id IN ({placeholders})"
             params.extend(sorted(template_ids))
-        queue = connection.execute(
-            f"SELECT q.* FROM reviewer_notification_queue q {where} ORDER BY q.id", params
-        ).fetchall()
 
+        queue = connection.execute(
+            f"SELECT q.* FROM reviewer_notification_queue q {where} ORDER BY q.template_id, q.id",
+            params,
+        ).fetchall()
+        if not queue:
+            return summary
+
+        rows_by_template: dict[str, list] = {}
         for row in queue:
-            template = templates.get(str(row["template_id"]), {"id": row["template_id"], "name": row["template_id"]})
+            rows_by_template.setdefault(str(row["template_id"]), []).append(row)
+
+        for template_id, rows in rows_by_template.items():
+            template = templates.get(template_id, {"id": template_id, "name": template_id})
             reviewers = connection.execute(
                 """
                 SELECT r.id, r.name, r.email FROM reviewers r
@@ -138,79 +148,139 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                 WHERE r.enabled = 1 AND rt.template_id = ?
                 ORDER BY r.name COLLATE NOCASE
                 """,
-                (row["template_id"],),
+                (template_id,),
             ).fetchall()
+
             if not reviewers:
-                summary["pending"] += 1
+                summary["pending"] += len(rows)
                 continue
 
-            delivered = False
-            errors: list[str] = []
             for reviewer in reviewers:
-                # Не отправляем повторно одному и тому же контролирующему.
-                previous = connection.execute(
-                    "SELECT status FROM reviewer_delivery_attempts WHERE queue_id = ? AND reviewer_id = ? AND status = 'sent'",
-                    (row["id"], reviewer["id"]),
-                ).fetchone()
-                if previous:
-                    delivered = True
+                unsent_rows = []
+                for row in rows:
+                    previous = connection.execute(
+                        """SELECT 1 FROM reviewer_delivery_attempts
+                           WHERE queue_id = ? AND reviewer_id = ? AND status = 'sent'
+                           LIMIT 1""",
+                        (row["id"], reviewer["id"]),
+                    ).fetchone()
+                    if not previous:
+                        unsent_rows.append(row)
+
+                if not unsent_rows:
                     continue
-                try:
-                    context = {
-                        "fio": row["fio"] or "Не указано", "email": row["email"] or "Не указан",
-                        "department": row["department"] or "Не указано", "position": row["position"] or "Не указана",
-                        "test_name": _template_name(template), "reminder_count": int(row["reminder_count"]),
+
+                employees = [
+                    {
+                        "fio": row["fio"] or "Не указано",
+                        "email": row["email"] or "Не указан",
+                        "department": row["department"] or "Не указано",
+                        "position": row["position"] or "Не указана",
+                        "reminder_count": int(row["reminder_count"] or 0),
                         "first_reminder_at": row["first_reminder_at"] or "Не указано",
                         "last_reminder_at": row["last_reminder_at"] or "Не указано",
                     }
+                    for row in unsent_rows
+                ]
+                first = employees[0]
+                context = {
+                    **first,
+                    "test_name": _template_name(template),
+                    "reviewer_name": reviewer["name"],
+                    "employees": employees,
+                    "employees_count": len(employees),
+                    "displayed_employees_count": len(employees),
+                }
+
+                try:
                     subject, body, mail_enabled = render_mail_template(db, "reviewer", "*", context)
                     if not mail_enabled:
-                        summary["pending"] += 1
+                        summary["pending"] += len(unsent_rows)
                         continue
+
                     send_html_email(settings.smtp, reviewer["email"], subject, body)
-                    connection.execute(
-                        """INSERT INTO reviewer_delivery_attempts(queue_id, reviewer_id, recipient_email, attempted_at, status, error_text)
-                           VALUES (?, ?, ?, ?, 'sent', NULL)""",
-                        (row["id"], reviewer["id"], reviewer["email"], utc_now().isoformat()),
-                    )
-                    delivered = True
-                    summary["delivered"] += 1
+                    attempted_at = utc_now().isoformat()
+                    for row in unsent_rows:
+                        connection.execute(
+                            """INSERT INTO reviewer_delivery_attempts(
+                                   queue_id, reviewer_id, recipient_email, attempted_at, status, error_text
+                               ) VALUES (?, ?, ?, ?, 'sent', NULL)""",
+                            (row["id"], reviewer["id"], reviewer["email"], attempted_at),
+                        )
+                    summary["delivered"] += len(unsent_rows)
                 except Exception as error:
                     error_text = str(error)
-                    errors.append(f"{reviewer['name']} <{reviewer['email']}>: {error_text}")
-                    connection.execute(
-                        """INSERT INTO reviewer_delivery_attempts(queue_id, reviewer_id, recipient_email, attempted_at, status, error_text)
-                           VALUES (?, ?, ?, ?, 'error', ?)""",
-                        (row["id"], reviewer["id"], reviewer["email"], utc_now().isoformat(), error_text),
-                    )
-                    summary["errors"] += 1
+                    attempted_at = utc_now().isoformat()
+                    for row in unsent_rows:
+                        connection.execute(
+                            """INSERT INTO reviewer_delivery_attempts(
+                                   queue_id, reviewer_id, recipient_email, attempted_at, status, error_text
+                               ) VALUES (?, ?, ?, ?, 'error', ?)""",
+                            (row["id"], reviewer["id"], reviewer["email"], attempted_at, error_text),
+                        )
+                        connection.execute(
+                            """UPDATE reviewer_notification_queue
+                               SET attempts = attempts + 1, last_error = ? WHERE id = ?""",
+                            (f"{reviewer['name']} <{reviewer['email']}>: {error_text}", row["id"]),
+                        )
+                    summary["errors"] += len(unsent_rows)
                     connection.commit()
                     notify_technical_error(
-                        settings, db,
+                        settings,
+                        db,
                         subject="При отправке сообщения обнаружена ошибка",
-                        fio=reviewer["name"], email_address=reviewer["email"],
+                        fio=reviewer["name"],
+                        email_address=reviewer["email"],
                         error_type="контролирующий не может получить сообщение",
                         error_text=error_text,
                     )
 
-            connection.execute(
-                "UPDATE reviewer_notification_queue SET attempts = attempts + 1, last_error = ? WHERE id = ?",
-                ("\n".join(errors) if errors else None, row["id"]),
-            )
-            if delivered:
-                connection.execute(
-                    "UPDATE reviewer_notification_queue SET status = 'delivered', delivered_at = ? WHERE id = ?",
-                    (utc_now().isoformat(), row["id"]),
-                )
-                employee = connection.execute(
-                    "SELECT * FROM employees WHERE worker_key = ?", (row["worker_key"],)
-                ).fetchone()
-                if employee:
-                    _journal(connection, event_type="Уведомление контролирующему", employee=employee,
-                             template=template, status="sent", reminder_number=row["reminder_count"],
-                             recipient=", ".join(r["email"] for r in reviewers), details=None)
-            else:
-                summary["pending"] += 1
+            # Запись считается доставленной только после успешной отправки всем активным
+            # контролирующим, назначенным на этот тест.
+            for row in rows:
+                sent_count = connection.execute(
+                    """SELECT COUNT(DISTINCT a.reviewer_id) AS count
+                       FROM reviewer_delivery_attempts a
+                       JOIN reviewers r ON r.id = a.reviewer_id AND r.enabled = 1
+                       JOIN reviewer_templates rt
+                         ON rt.reviewer_id = r.id AND rt.template_id = ?
+                       WHERE a.queue_id = ? AND a.status = 'sent'""",
+                    (template_id, row["id"]),
+                ).fetchone()["count"]
+                required_count = connection.execute(
+                    """SELECT COUNT(*) AS count
+                       FROM reviewers r
+                       JOIN reviewer_templates rt ON rt.reviewer_id = r.id
+                       WHERE r.enabled = 1 AND rt.template_id = ?""",
+                    (template_id,),
+                ).fetchone()["count"]
+
+                if required_count > 0 and sent_count >= required_count:
+                    delivered_at = utc_now().isoformat()
+                    connection.execute(
+                        """UPDATE reviewer_notification_queue
+                           SET status = 'delivered', delivered_at = ?, last_error = NULL,
+                               attempts = attempts + 1
+                           WHERE id = ?""",
+                        (delivered_at, row["id"]),
+                    )
+                    employee = connection.execute(
+                        "SELECT * FROM employees WHERE worker_key = ?", (row["worker_key"],)
+                    ).fetchone()
+                    if employee:
+                        _journal(
+                            connection,
+                            event_type="Уведомление контролирующему",
+                            employee=employee,
+                            template=template,
+                            status="sent",
+                            reminder_number=row["reminder_count"],
+                            recipient=", ".join(r["email"] for r in reviewers),
+                            details=f"Сводное письмо: {len(rows)} работников",
+                        )
+                else:
+                    summary["pending"] += 1
+
     return summary
 
 

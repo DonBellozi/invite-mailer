@@ -35,8 +35,22 @@ def ensure_mail_templates(db: Database, templates: list[dict]) -> None:
         )
         defaults.append(("reminder", tid, str(template.get("reminder_subject") or f"Напоминание: {template.get('subject') or name}"), reminder_body, 1))
     defaults.extend([
-        ("reviewer", "*", "Работник игнорирует прохождение теста «{{ test_name }}»",
-         "<p>Работник не завершил обязательное тестирование после всех предусмотренных напоминаний.</p><p>ФИО: {{ fio }}<br>E-mail: {{ email }}<br>Подразделение: {{ department }}<br>Должность: {{ position }}<br>Тест: {{ test_name }}<br>Количество напоминаний: {{ reminder_count }}<br>Первое напоминание: {{ first_reminder_at }}<br>Последнее напоминание: {{ last_reminder_at }}</p>", 1),
+        ("reviewer", "*", "Требуется контроль прохождения тестирования – {{ test_name }}",
+         "<p>Здравствуйте!</p>"
+         "<p>Следующие работники не прошли тестирование <strong>«{{ test_name }}»</strong> после установленного количества напоминаний.</p>"
+         "<p>Количество работников: <strong>{{ employees_count }}</strong>.</p>"
+         "{% for employee in employees %}"
+         "<div style='margin:0 0 16px 0;padding:12px;border:1px solid #d9d9d9;border-radius:6px'>"
+         "<p style='margin:0 0 6px 0'><strong>ФИО:</strong> {{ employee.fio }}</p>"
+         "<p style='margin:0 0 6px 0'><strong>E-mail:</strong> {{ employee.email }}</p>"
+         "{% if employee.department %}<p style='margin:0 0 6px 0'><strong>Подразделение:</strong> {{ employee.department }}</p>{% endif %}"
+         "{% if employee.position %}<p style='margin:0 0 6px 0'><strong>Должность:</strong> {{ employee.position }}</p>{% endif %}"
+         "<p style='margin:0 0 6px 0'><strong>Количество направленных напоминаний:</strong> {{ employee.reminder_count }}</p>"
+         "{% if employee.first_reminder_at %}<p style='margin:0 0 6px 0'><strong>Первое напоминание:</strong> {{ employee.first_reminder_at }}</p>{% endif %}"
+         "{% if employee.last_reminder_at %}<p style='margin:0'><strong>Последнее напоминание:</strong> {{ employee.last_reminder_at }}</p>{% endif %}"
+         "</div>{% endfor %}"
+         "<p>Просим проконтролировать прохождение тестирования указанными работниками.</p>"
+         "<p>Письмо сформировано автоматически.</p>", 1),
         ("technical", "*", "{{ subject }}",
          "<p>При выполнении рассылки обнаружено ошибок: <strong>{{ errors_count }}</strong>.</p>"
          "{% for error in errors %}"
@@ -61,6 +75,16 @@ def ensure_mail_templates(db: Database, templates: list[dict]) -> None:
             """UPDATE mail_templates SET body_html = ?, updated_at = ?
                WHERE kind = 'technical' AND template_id = '*' AND body_html = ?""",
             (new_technical_body, _now(), old_technical_body),
+        )
+        # Однократное безопасное обновление прежнего стандартного шаблона контролирующих.
+        # Пользовательские шаблоны не изменяются.
+        old_reviewer_subject = "Работник игнорирует прохождение теста «{{ test_name }}»"
+        old_reviewer_body = "<p>Работник не завершил обязательное тестирование после всех предусмотренных напоминаний.</p><p>ФИО: {{ fio }}<br>E-mail: {{ email }}<br>Подразделение: {{ department }}<br>Должность: {{ position }}<br>Тест: {{ test_name }}<br>Количество напоминаний: {{ reminder_count }}<br>Первое напоминание: {{ first_reminder_at }}<br>Последнее напоминание: {{ last_reminder_at }}</p>"
+        new_reviewer = next((subject, body) for kind, tid, subject, body, _enabled in defaults if kind == "reviewer" and tid == "*")
+        c.execute(
+            """UPDATE mail_templates SET subject = ?, body_html = ?, updated_at = ?
+               WHERE kind = 'reviewer' AND template_id = '*' AND subject = ? AND body_html = ?""",
+            (new_reviewer[0], new_reviewer[1], _now(), old_reviewer_subject, old_reviewer_body),
         )
 
 

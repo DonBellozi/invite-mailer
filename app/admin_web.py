@@ -848,61 +848,101 @@ def _technical_test_context(db: Database, limit: int = 20) -> tuple[dict, str, i
 def _reviewer_test_context(db: Database) -> tuple[dict, str, int]:
     templates = {str(item["id"]): item for item in load_test_definitions(settings(), db)}
     with db.connect() as connection:
-        row = connection.execute(
+        queue_rows = connection.execute(
             """
             SELECT * FROM reviewer_notification_queue
             ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END, created_at DESC, id DESC
-            LIMIT 1
             """
-        ).fetchone()
-        if row:
-            template = templates.get(str(row["template_id"]), {})
-            return {
-                "fio": str(row["fio"] or "Не указано"),
-                "email": str(row["email"] or "Не указан"),
-                "department": str(row["department"] or "Не указано"),
-                "position": str(row["position"] or "Не указана"),
-                "test_name": str(template.get("name") or row["template_id"] or "Тест"),
-                "reminder_count": int(row["reminder_count"] or 0),
-                "first_reminder_at": _display_timestamp(row["first_reminder_at"]),
-                "last_reminder_at": _display_timestamp(row["last_reminder_at"]),
-                "reviewer_name": "Контролирующий",
-            }, "real_queue", 1
+        ).fetchall()
 
-        employee = connection.execute(
+        if queue_rows:
+            selected_template_id = str(queue_rows[0]["template_id"])
+            selected_rows = [row for row in queue_rows if str(row["template_id"]) == selected_template_id][:20]
+            template = templates.get(selected_template_id, {})
+            employees = [
+                {
+                    "fio": str(row["fio"] or "Не указано"),
+                    "email": str(row["email"] or "Не указан"),
+                    "department": str(row["department"] or "Не указано"),
+                    "position": str(row["position"] or "Не указана"),
+                    "reminder_count": int(row["reminder_count"] or 0),
+                    "first_reminder_at": _display_timestamp(row["first_reminder_at"]),
+                    "last_reminder_at": _display_timestamp(row["last_reminder_at"]),
+                }
+                for row in selected_rows
+            ]
+            first = employees[0]
+            return {
+                **first,
+                "test_name": str(template.get("name") or selected_template_id or "Тест"),
+                "reviewer_name": "Контролирующий",
+                "employees": employees,
+                "employees_count": len(employees),
+                "displayed_employees_count": len(employees),
+            }, "real_queue", len(employees)
+
+        employee_rows = connection.execute(
             """
             SELECT * FROM employees
             ORDER BY active DESC, updated_at DESC, fio COLLATE NOCASE
-            LIMIT 1
+            LIMIT 5
             """
-        ).fetchone()
+        ).fetchall()
 
-    if employee:
+    if employee_rows:
         template = next(iter(templates.values()), {})
         now = datetime.now().astimezone()
+        employees = [
+            {
+                "fio": str(employee["fio"] or "Не указано"),
+                "email": str(employee["email"] or "Не указан"),
+                "department": str(employee["department"] or "Не указано"),
+                "position": str(employee["position"] or "Не указана"),
+                "reminder_count": 3,
+                "first_reminder_at": (now - timedelta(days=14)).strftime("%d.%m.%Y %H:%M:%S"),
+                "last_reminder_at": now.strftime("%d.%m.%Y %H:%M:%S"),
+            }
+            for employee in employee_rows
+        ]
+        first = employees[0]
         return {
-            "fio": str(employee["fio"] or "Не указано"),
-            "email": str(employee["email"] or "Не указан"),
-            "department": str(employee["department"] or "Не указано"),
-            "position": str(employee["position"] or "Не указана"),
+            **first,
             "test_name": str(template.get("name") or "Тест"),
-            "reminder_count": 3,
-            "first_reminder_at": (now - timedelta(days=14)).strftime("%d.%m.%Y %H:%M:%S"),
-            "last_reminder_at": now.strftime("%d.%m.%Y %H:%M:%S"),
             "reviewer_name": "Контролирующий",
-        }, "real_employee", 1
+            "employees": employees,
+            "employees_count": len(employees),
+            "displayed_employees_count": len(employees),
+        }, "real_employee", len(employees)
 
+    employees = [
+        {
+            "fio": "Иванов Иван Иванович",
+            "email": "ivanov.ii@example.ru",
+            "department": "Тестовое подразделение",
+            "position": "Тестовая должность",
+            "reminder_count": 3,
+            "first_reminder_at": "01.07.2026 09:00:00",
+            "last_reminder_at": "15.07.2026 09:00:00",
+        },
+        {
+            "fio": "Петров Петр Петрович",
+            "email": "petrov.pp@example.ru",
+            "department": "Демонстрационное подразделение",
+            "position": "Ведущий специалист",
+            "reminder_count": 3,
+            "first_reminder_at": "02.07.2026 09:00:00",
+            "last_reminder_at": "16.07.2026 09:00:00",
+        },
+    ]
+    first = employees[0]
     return {
-        "fio": "Иванов Иван Иванович",
-        "email": "ivanov.ii@example.ru",
-        "department": "Тестовое подразделение",
-        "position": "Тестовая должность",
+        **first,
         "test_name": "Тестовое тестирование",
-        "reminder_count": 3,
-        "first_reminder_at": "01.07.2026 09:00:00",
-        "last_reminder_at": "15.07.2026 09:00:00",
         "reviewer_name": "Контролирующий",
-    }, "demo", 1
+        "employees": employees,
+        "employees_count": len(employees),
+        "displayed_employees_count": len(employees),
+    }, "demo", len(employees)
 
 
 @app.post("/api/settings/templates/test-email")
