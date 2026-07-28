@@ -32,6 +32,9 @@ from .logic import rebuild_report
 from .reminders import dispatch_pending_reviewer_notifications
 from .settings import Settings, load_settings
 from .mail_templates import ensure_mail_templates
+from .mail_templates import render_mail_template
+from .mailer import send_html_email
+from .test_catalog import ensure_test_definitions, load_test_definitions
 
 from .report_export import (
     PDF_MEDIA_TYPE,
@@ -258,9 +261,33 @@ class ReviewerRequest(BaseModel):
     receives_technical_errors: bool = False
 
 
+class TestEmailRequest(BaseModel):
+    recipient: str
+    kind: str
+    template_id: str = "*"
+    subject: str
+    body_html: str
+
+
+class TestDefinitionRequest(BaseModel):
+    id: str
+    enabled: bool = True
+    name: str
+    mode: str = "once"
+    validity_days: int | None = None
+    audience_type: str = "all"
+    departments_include: list[str] = ["*"]
+    departments_exclude: list[str] = []
+    indigo_logical_test_id: int | None = None
+    indigo_test_name: str = ""
+    indigo_success_results: list[str] = []
+    indigo_failed_prefixes: list[str] = []
+
+
 def find_report_template(
     template_id: str,
 ) -> dict:
+    settings().templates[:] = load_test_definitions(settings(), database())
     for template in settings().templates:
         if str(template.get("id")) == template_id:
             return template
@@ -297,6 +324,11 @@ def general_settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
 @app.get("/admin/settings/reviewers/", response_class=HTMLResponse)
 def reviewers_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return REVIEWERS_HTML
+
+
+@app.get("/admin/settings/tests/", response_class=HTMLResponse)
+def tests_page(_: Annotated[str, Depends(require_admin)]) -> str:
+    return TESTS_HTML
 
 
 @app.get("/admin/settings/templates/", response_class=HTMLResponse)
@@ -364,6 +396,7 @@ def write_reminder_settings(
 
 @app.get("/api/reviewers")
 def read_reviewers(_: Annotated[str, Depends(require_admin)]):
+    settings().templates[:] = load_test_definitions(settings(), database())
     with database().connect() as connection:
         rows = connection.execute(
             """
@@ -392,6 +425,7 @@ def read_reviewers(_: Annotated[str, Depends(require_admin)]):
 
 
 def _save_reviewer_templates(connection, reviewer_id: int, template_ids: list[str]) -> None:
+    settings().templates[:] = load_test_definitions(settings(), database())
     allowed = {str(template["id"]) for template in settings().templates}
     normalized = sorted({str(value).strip() for value in template_ids if str(value).strip()})
     unknown = set(normalized) - allowed
@@ -558,6 +592,7 @@ def remove_login_override(
 
 @app.get("/api/audience/templates")
 def list_templates(_: Annotated[str, Depends(require_admin)]):
+    settings().templates[:] = load_test_definitions(settings(), database())
     result = []
     for template in explicit_templates(settings()):
         result.append(
@@ -576,6 +611,7 @@ async def preview_upload(
     file: Annotated[UploadFile, File()],
     username: Annotated[str, Depends(require_admin)],
 ):
+    settings().templates[:] = load_test_definitions(settings(), database())
     content = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Размер файла превышает 20 МБ")
@@ -708,6 +744,7 @@ class MailTemplateRequest(BaseModel):
 @app.get("/api/settings/templates")
 def list_mail_templates(_: Annotated[str, Depends(require_admin)]):
     db = database()
+    settings().templates[:] = load_test_definitions(settings(), db)
     ensure_mail_templates(db, settings().templates)
     names = {str(t["id"]): str(t.get("name") or t["id"]) for t in settings().templates}
     with db.connect() as connection:
@@ -729,13 +766,141 @@ def save_mail_template(kind: str, template_id: str, request: MailTemplateRequest
     return {"status": "ok"}
 
 
-SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card,.item{background:#fff;border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.card{margin-bottom:18px}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px}.link{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.link:hover{background:#f2f4f7}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 8px;font-size:18px}.small,p{color:#667085;font-size:13px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:18px}.item{display:flex;flex-direction:column;min-height:150px;border:1px solid #e1e5ea}.item .link{margin-top:auto;align-self:flex-start;background:#175cd3;color:#fff;border-color:#175cd3}@media(max-width:800px){.grid{grid-template-columns:1fr}.header{flex-direction:column}}</style></head><body><div class="card"><div class="header"><div><h1>Настройки</h1><div class="small">Управление рассылкой, контролирующими и журналом уведомлений.</div></div><div class="actions"><a class="link" href="/admin/">Импорт участников</a><a class="link" href="/">Отчет</a></div></div></div><div class="grid"><section class="item"><h2>Общие настройки</h2><p>Интервал и максимальное количество напоминаний, уведомление контролирующих и срок хранения журнала.</p><a class="link" href="/admin/settings/general/">Открыть</a></section><section class="item"><h2>Контролирующие</h2><p>Назначение контролирующих по тестам и получение технических ошибок.</p><a class="link" href="/admin/settings/reviewers/">Открыть</a></section><section class="item"><h2>Журнал уведомлений</h2><p>Просмотр событий рассылки, уведомлений контролирующим и технических ошибок.</p><a class="link" href="/admin/journal/">Открыть</a></section><section class="item"><h2>Сопоставление логинов</h2><p>Ручное сопоставление e-mail работников с логинами Indigo.</p><a class="link" href="/admin/logins/">Открыть</a></section><section class="item"><h2>Шаблоны</h2><p>Темы и тексты приглашений, напоминаний, уведомлений контролирующим и технических сообщений.</p><a class="link" href="/admin/settings/templates/">Открыть</a></section></div></body></html>"""
+@app.post("/api/settings/templates/test-email")
+def send_test_template(request: TestEmailRequest, _: Annotated[str, Depends(require_admin)]):
+    recipient = request.recipient.strip()
+    if not recipient or "@" not in recipient or recipient.startswith("@") or recipient.endswith("@"):
+        raise HTTPException(status_code=400, detail="Укажите корректный e-mail получателя")
+    if request.kind not in {"invitation", "reminder", "reviewer", "technical"}:
+        raise HTTPException(status_code=400, detail="Неизвестный тип шаблона")
+    context = {
+        "fio": "Иванов Иван Иванович", "email": recipient, "login": "ivanov.ii",
+        "department": "Тестовое подразделение", "position": "Тестовая должность",
+        "test_name": next((str(t.get("name")) for t in load_test_definitions(settings(), database()) if str(t.get("id")) == request.template_id), "Тест"),
+        "reminder_number": 1, "reminder_count": 3,
+        "first_reminder_at": "01.07.2026 09:00", "last_reminder_at": "15.07.2026 09:00",
+        "subject": "Тестовое техническое уведомление", "error_type": "тестовая ошибка",
+        "error_text": "Проверка отображения шаблона", "detected_at": _utc_now(),
+        "reviewer_name": "Контролирующий",
+    }
+    from jinja2 import Environment, StrictUndefined
+    try:
+        env = Environment(undefined=StrictUndefined, autoescape=True)
+        subject = env.from_string(request.subject).render(**context)
+        body = env.from_string(request.body_html).render(**context)
+        send_html_email(settings().smtp, recipient, subject, body)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Не удалось отправить тестовое письмо: {error}") from error
+    return {"status": "ok"}
+
+
+@app.get("/api/settings/tests")
+def list_test_definitions(_: Annotated[str, Depends(require_admin)]):
+    items = load_test_definitions(settings(), database())
+    return {"items": items}
+
+
+def _normalize_string_list(values: list[str], default: list[str] | None = None) -> list[str]:
+    result = []
+    for value in values:
+        text = str(value).strip()
+        if text and text not in result:
+            result.append(text)
+    return result or (default or [])
+
+
+@app.post("/api/settings/tests")
+def create_test_definition(request: TestDefinitionRequest, _: Annotated[str, Depends(require_admin)]):
+    test_id = request.id.strip().lower()
+    if not test_id or not all(ch.isalnum() or ch in "_-" for ch in test_id):
+        raise HTTPException(status_code=400, detail="Идентификатор может содержать буквы, цифры, _ и -")
+    if request.audience_type not in {"all", "explicit_list"}:
+        raise HTTPException(status_code=400, detail="Неизвестный тип участников")
+    import json
+    now = _utc_now()
+    with database().connect() as connection:
+        exists = connection.execute("SELECT 1 FROM test_definitions WHERE id=?", (test_id,)).fetchone()
+        if exists:
+            raise HTTPException(status_code=409, detail="Тест с таким идентификатором уже существует")
+        connection.execute("""INSERT INTO test_definitions(id,enabled,name,mode,validity_days,audience_type,departments_include_json,departments_exclude_json,indigo_logical_test_id,indigo_test_name,indigo_success_results_json,indigo_failed_prefixes_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (test_id,int(request.enabled),request.name.strip(),request.mode,request.validity_days,request.audience_type,json.dumps(_normalize_string_list(request.departments_include,["*"]),ensure_ascii=False),json.dumps(_normalize_string_list(request.departments_exclude),ensure_ascii=False),request.indigo_logical_test_id,request.indigo_test_name.strip() or request.name.strip(),json.dumps(_normalize_string_list(request.indigo_success_results),ensure_ascii=False),json.dumps(_normalize_string_list(request.indigo_failed_prefixes),ensure_ascii=False),now,now))
+    settings().templates[:] = load_test_definitions(settings(), database())
+    ensure_mail_templates(database(), settings().templates)
+    return {"status":"ok","id":test_id}
+
+
+@app.put("/api/settings/tests/{test_id}")
+def update_test_definition(test_id: str, request: TestDefinitionRequest, _: Annotated[str, Depends(require_admin)]):
+    if request.audience_type not in {"all", "explicit_list"}:
+        raise HTTPException(status_code=400, detail="Неизвестный тип участников")
+    import json
+    with database().connect() as connection:
+        cursor = connection.execute("""UPDATE test_definitions SET enabled=?,name=?,mode=?,validity_days=?,audience_type=?,departments_include_json=?,departments_exclude_json=?,indigo_logical_test_id=?,indigo_test_name=?,indigo_success_results_json=?,indigo_failed_prefixes_json=?,updated_at=? WHERE id=?""",
+            (int(request.enabled),request.name.strip(),request.mode,request.validity_days,request.audience_type,json.dumps(_normalize_string_list(request.departments_include,["*"]),ensure_ascii=False),json.dumps(_normalize_string_list(request.departments_exclude),ensure_ascii=False),request.indigo_logical_test_id,request.indigo_test_name.strip() or request.name.strip(),json.dumps(_normalize_string_list(request.indigo_success_results),ensure_ascii=False),json.dumps(_normalize_string_list(request.indigo_failed_prefixes),ensure_ascii=False),_utc_now(),test_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Тест не найден")
+    settings().templates[:] = load_test_definitions(settings(), database())
+    return {"status":"ok"}
+
+
+@app.delete("/api/settings/tests/{test_id}")
+def delete_test_definition(test_id: str, _: Annotated[str, Depends(require_admin)]):
+    with database().connect() as connection:
+        used = connection.execute("SELECT 1 FROM notification_history WHERE template_id=? LIMIT 1", (test_id,)).fetchone() or connection.execute("SELECT 1 FROM test_assignments WHERE template_id=? LIMIT 1", (test_id,)).fetchone()
+        if used:
+            connection.execute("UPDATE test_definitions SET enabled=0, updated_at=? WHERE id=?", (_utc_now(), test_id))
+            return {"status":"disabled","detail":"Тест уже используется, поэтому он отключен, а не удален"}
+        connection.execute("DELETE FROM reviewer_templates WHERE template_id=?", (test_id,))
+        connection.execute("DELETE FROM mail_templates WHERE template_id=?", (test_id,))
+        cursor = connection.execute("DELETE FROM test_definitions WHERE id=?", (test_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Тест не найден")
+    settings().templates[:] = load_test_definitions(settings(), database())
+    return {"status":"deleted"}
+
+
+SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card,.item{background:#fff;border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.card{margin-bottom:18px}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px}.link{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.link:hover{background:#f2f4f7}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 8px;font-size:18px}.small,p{color:#667085;font-size:13px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:18px}.item{display:flex;flex-direction:column;min-height:150px;border:1px solid #e1e5ea}.item .link{margin-top:auto;align-self:flex-start;background:#175cd3;color:#fff;border-color:#175cd3}@media(max-width:800px){.grid{grid-template-columns:1fr}.header{flex-direction:column}}</style></head><body><div class="card"><div class="header"><div><h1>Настройки</h1><div class="small">Управление рассылкой, контролирующими и журналом уведомлений.</div></div><div class="actions"><a class="link" href="/admin/">Импорт участников</a><a class="link" href="/">Отчет</a></div></div></div><div class="grid"><section class="item"><h2>Общие настройки</h2><p>Интервал и максимальное количество напоминаний, уведомление контролирующих и срок хранения журнала.</p><a class="link" href="/admin/settings/general/">Открыть</a></section><section class="item"><h2>Контролирующие</h2><p>Назначение контролирующих по тестам и получение технических ошибок.</p><a class="link" href="/admin/settings/reviewers/">Открыть</a></section><section class="item"><h2>Журнал уведомлений</h2><p>Просмотр событий рассылки, уведомлений контролирующим и технических ошибок.</p><a class="link" href="/admin/journal/">Открыть</a></section><section class="item"><h2>Сопоставление логинов</h2><p>Ручное сопоставление e-mail работников с логинами Indigo.</p><a class="link" href="/admin/logins/">Открыть</a></section><section class="item"><h2>Тесты</h2><p>Добавление тестов, выбор участников и настройка сопоставления с Indigo.</p><a class="link" href="/admin/settings/tests/">Открыть</a></section><section class="item"><h2>Шаблоны</h2><p>Темы и тексты приглашений, напоминаний, уведомлений контролирующим и технических сообщений.</p><a class="link" href="/admin/settings/templates/">Открыть</a></section></div></body></html>"""
 
 
 GENERAL_SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Общие настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px}.link{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.link:hover{background:#f2f4f7}.form{max-width:760px}.row{display:grid;grid-template-columns:1fr 200px;gap:16px;align-items:center;padding:14px 0;border-bottom:1px solid #eaecf0}label{font-weight:600}.hint,.small{color:#667085;font-size:12px}input[type=number]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}input[type=checkbox]{width:20px;height:20px}.save{margin-top:18px;padding:10px 16px;border:0;border-radius:7px;background:#175cd3;color:#fff;font-weight:600}.message{display:none;margin-top:14px;padding:12px;border-radius:7px}.success{display:block;background:#ecfdf3;color:#05603a}.error{display:block;background:#fef3f2;color:#912018}@media(max-width:720px){.header{flex-direction:column}.row{grid-template-columns:1fr}}</style></head><body><div class="card"><div class="header"><div><h1>Общие настройки</h1><div class="small">Параметры повторных напоминаний, контролирующих и журнала.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div><div class="card"><form id="form" class="form"><div class="row"><div><label>Отправлять повторные напоминания</label><div class="hint">Для работников, которым приглашение уже отправлено, но тест не завершен.</div></div><input id="enabled" type="checkbox"></div><div class="row"><div><label>Интервал между напоминаниями</label><div class="hint">Количество календарных дней.</div></div><input id="interval" type="number" min="1" max="365"></div><div class="row"><div><label>Время автоматического запуска</label><div class="hint">Ежедневная проверка работников, у которых наступил срок напоминания.</div></div><div style="display:flex;gap:8px"><input id="run-hour" type="number" min="0" max="23" title="Часы"><input id="run-minute" type="number" min="0" max="59" title="Минуты"></div></div><div class="row"><div><label>Максимальное количество напоминаний</label><div class="hint">После последнего напоминания работник получает статус «Игнорирует прохождение», а контролирующим отправляется одно письмо.</div></div><input id="max-reminders" type="number" min="1" max="100"></div><div class="row"><div><label>Уведомлять контролирующих</label><div class="hint">Письмо отправляется один раз после исчерпания всех напоминаний.</div></div><input id="notify-reviewers" type="checkbox"></div><div class="row"><div><label>Повтор одинаковой технической ошибки</label><div class="hint">Повторное техническое уведомление отправляется после указанного интервала. Рекомендуемое значение – 72 часа.</div></div><input id="technical-repeat" type="number" min="1" max="8760"></div><div class="row"><div><label>Срок хранения журнала</label><div class="hint">Подробный журнал очищается автоматически. Основная история отправок сохраняется.</div></div><input id="retention" type="number" min="30" max="3650"></div><button class="save">Сохранить</button><div id="message" class="message"></div></form></div><script>async function api(u,o={}){const r=await fetch(u,o);let p={};try{p=await r.json()}catch(_){p={}}if(!r.ok)throw new Error(formatError(p,r.status));return p}function formatError(p,status){const d=p&&p.detail;if(typeof d==='string')return d;if(Array.isArray(d))return d.map(x=>{const field=Array.isArray(x.loc)?x.loc[x.loc.length-1]:'';return `${field?field+': ':''}${x.msg||JSON.stringify(x)}`}).join('; ');if(d&&typeof d==='object')return d.message||d.msg||JSON.stringify(d);return p.message||p.error||`HTTP ${status}`}function msg(t,k){const n=document.getElementById('message');n.textContent=t;n.className=`message ${k}`}async function load(){const p=await api('/api/settings/reminders');enabled.checked=p.enabled;interval.value=p.interval_days;document.getElementById('max-reminders').value=p.max_reminders;document.getElementById('notify-reviewers').checked=p.notify_reviewers;retention.value=p.journal_retention_days;document.getElementById('technical-repeat').value=p.technical_repeat_hours;document.getElementById('run-hour').value=p.run_hour;document.getElementById('run-minute').value=p.run_minute}form.addEventListener('submit',async e=>{e.preventDefault();try{const p=await api('/api/settings/reminders',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled.checked,interval_days:Number(interval.value),max_reminders:Number(document.getElementById('max-reminders').value),notify_reviewers:document.getElementById('notify-reviewers').checked,journal_retention_days:Number(retention.value),technical_repeat_hours:Number(document.getElementById('technical-repeat').value),run_hour:Number(document.getElementById('run-hour').value),run_minute:Number(document.getElementById('run-minute').value)})});msg(`Сохранено. Максимум напоминаний: ${p.max_reminders}.`,'success')}catch(x){msg(x.message,'error')}});load().catch(x=>msg(x.message,'error'))</script></body></html>"""
 
 
-TEMPLATES_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Шаблоны писем</title><style>body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px}.link,button{display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;background:#fff;color:#344054;text-decoration:none;font-size:13px;font-weight:600;cursor:pointer}.editor{display:grid;grid-template-columns:280px 1fr;gap:18px}select,input,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}textarea{min-height:390px;font-family:Consolas,monospace;font-size:13px}label{display:block;margin:10px 0 5px;font-weight:600}.hint,.small{color:#667085;font-size:12px}.save{margin-top:12px;background:#175cd3;color:#fff;border-color:#175cd3}.message{margin-top:12px;padding:10px;border-radius:6px}.success{background:#ecfdf3}.error{background:#fef3f2}@media(max-width:850px){.editor{grid-template-columns:1fr}.header{flex-direction:column}}</style></head><body><div class="card"><div class="header"><div><h1>Шаблоны писем</h1><div class="small">Шаблоны хранятся в базе данных и применяются без изменения кода.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div><div class="card editor"><div><label>Шаблон</label><select id="list"></select><p class="hint">Переменные: {{ fio }}, {{ email }}, {{ login }}, {{ department }}, {{ position }}, {{ test_name }}, {{ reminder_number }}. Для служебных шаблонов также доступны данные ошибки и контролирующего.</p><label><input id="enabled" type="checkbox" style="width:auto"> Использовать шаблон</label></div><form id="form"><label>Тема письма</label><input id="subject" required><label>HTML-текст письма</label><textarea id="body" required></textarea><button class="save">Сохранить</button><div id="message"></div></form></div><script>let items=[];const list=document.getElementById('list'),subject=document.getElementById('subject'),body=document.getElementById('body'),enabled=document.getElementById('enabled'),message=document.getElementById('message');const labels={invitation:'Первоначальное приглашение',reminder:'Напоминание',reviewer:'Контролирующему',technical:'Техническое уведомление'};async function api(u,o={}){const r=await fetch(u,o);let p={};try{p=await r.json()}catch(_){p={}}if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}function current(){return items[Number(list.value)||0]}function show(){const x=current();if(!x)return;subject.value=x.subject;body.value=x.body_html;enabled.checked=!!x.enabled;message.textContent='';message.className=''}async function load(){const p=await api('/api/settings/templates');items=p.items;list.innerHTML=items.map((x,i)=>`<option value="${i}">${labels[x.kind]||x.kind}${x.template_id==='*'?'':` – ${x.test_name}`}</option>`).join('');show()}list.onchange=show;form.onsubmit=async e=>{e.preventDefault();const x=current();try{await api(`/api/settings/templates/${encodeURIComponent(x.kind)}/${encodeURIComponent(x.template_id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({subject:subject.value,body_html:body.value,enabled:enabled.checked})});x.subject=subject.value;x.body_html=body.value;x.enabled=enabled.checked;message.textContent='Шаблон сохранен.';message.className='message success'}catch(err){message.textContent=err.message;message.className='message error'}};load().catch(err=>{message.textContent=err.message;message.className='message error'})</script></body></html>"""
+TEMPLATES_HTML = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Шаблоны писем</title><style>
+body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px}.link,button{display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;background:#fff;color:#344054;text-decoration:none;font-size:13px;font-weight:600;cursor:pointer}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.danger{color:#b42318}.top-grid{display:grid;grid-template-columns:280px 1fr;gap:18px}.template-block{border:1px solid #e1e5ea;border-radius:9px;padding:16px;margin-bottom:16px}select,input,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}textarea{min-height:280px;font-family:Consolas,monospace;font-size:13px}label{display:block;margin:10px 0 5px;font-weight:600}.hint,.small{color:#667085;font-size:12px}.row{display:flex;gap:10px;align-items:end}.row>div{flex:1}.message{margin-top:12px;padding:10px;border-radius:6px}.success{background:#ecfdf3;color:#05603a}.error{background:#fef3f2;color:#912018}.hidden{display:none}@media(max-width:850px){.top-grid{grid-template-columns:1fr}.header{flex-direction:column}.row{flex-direction:column;align-items:stretch}}</style></head>
+<body><div class="card"><div class="header"><div><h1>Шаблоны писем</h1><div class="small">Для каждого теста первоначальное приглашение и напоминание редактируются на одной странице.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div>
+<div class="card top-grid"><div><label>Раздел шаблонов</label><select id="group"></select><p class="hint">Тестовые шаблоны сгруппированы по тестам. Общие служебные письма редактируются отдельно.</p></div><div><div id="editors"></div><div class="row"><div><label>Получатель тестового письма</label><input id="testEmail" type="email" placeholder="user@example.ru"></div></div><button id="saveAll" class="primary" type="button" style="margin-top:14px">Сохранить изменения</button><div id="message"></div></div></div>
+<script>
+let items=[],groups=[];const labels={invitation:'Первоначальное приглашение',reminder:'Напоминание',reviewer:'Контролирующему',technical:'Техническое уведомление'};
+const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+async function api(u,o={}){const r=await fetch(u,o);let p={};try{p=await r.json()}catch(_){p={}}if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}
+function msg(t,k){const m=document.getElementById('message');m.textContent=t;m.className=`message ${k}`}
+function buildGroups(){const tests={};items.filter(x=>x.template_id!=='*').forEach(x=>{tests[x.template_id]??={key:`test:${x.template_id}`,name:x.test_name,items:[]};tests[x.template_id].items.push(x)});groups=Object.values(tests).sort((a,b)=>a.name.localeCompare(b.name,'ru'));for(const kind of ['reviewer','technical']){const x=items.find(i=>i.kind===kind&&i.template_id==='*');if(x)groups.push({key:`service:${kind}`,name:labels[kind],items:[x]})}group.innerHTML=groups.map((g,i)=>`<option value="${i}">${esc(g.name)}</option>`).join('')}
+function render(){const g=groups[Number(group.value)||0];if(!g)return;editors.innerHTML=g.items.sort((a,b)=>a.kind==='invitation'?-1:1).map((x,i)=>`<section class="template-block" data-index="${items.indexOf(x)}"><h2>${esc(labels[x.kind]||x.kind)}</h2><label><input class="enabled" type="checkbox" style="width:auto" ${x.enabled?'checked':''}> Использовать шаблон</label><label>Тема письма</label><input class="subject" value="${esc(x.subject)}"><label>HTML-текст письма</label><textarea class="body">${esc(x.body_html)}</textarea><div class="row"><button type="button" class="save-one primary" data-item="${items.indexOf(x)}">Сохранить этот шаблон</button><button type="button" class="test-one" data-item="${items.indexOf(x)}">Отправить тестовое письмо</button></div></section>`).join('');document.querySelectorAll('.save-one').forEach(b=>b.onclick=()=>saveIndexes([Number(b.dataset.item)]));document.querySelectorAll('.test-one').forEach(b=>b.onclick=()=>sendTestItem(Number(b.dataset.item)))}
+function collect(index){const block=document.querySelector(`[data-index="${index}"]`);return {subject:block.querySelector('.subject').value,body_html:block.querySelector('.body').value,enabled:block.querySelector('.enabled').checked}}
+async function saveIndexes(indexes){try{for(const i of indexes){const x=items[i],v=collect(i);await api(`/api/settings/templates/${encodeURIComponent(x.kind)}/${encodeURIComponent(x.template_id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(v)});Object.assign(x,v)}msg('Изменения сохранены.','success')}catch(e){msg(e.message,'error')}}
+async function load(){const p=await api('/api/settings/templates');items=p.items;buildGroups();render()}
+group.onchange=render;saveAll.onclick=()=>saveIndexes([...document.querySelectorAll('[data-index]')].map(x=>Number(x.dataset.index)));
+async function sendTestItem(i){const recipient=testEmail.value.trim(),x=items[i],v=collect(i);try{await api('/api/settings/templates/test-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient,kind:x.kind,template_id:x.template_id,...v})});msg('Тестовое письмо отправлено.','success')}catch(e){msg(e.message,'error')}};
+load().catch(e=>msg(e.message,'error'));
+</script></body></html>"""
+
+TESTS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Настройка тестов</title><style>
+body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px}.link,button{display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;background:#fff;color:#344054;text-decoration:none;font-size:13px;font-weight:600;cursor:pointer}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.danger{color:#b42318;border-color:#f04438}.grid{display:grid;grid-template-columns:repeat(2,minmax(250px,1fr));gap:14px}.full{grid-column:1/-1}label{display:block;margin:5px 0;font-size:12px;font-weight:600}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}textarea{min-height:80px}.small{color:#667085;font-size:12px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px 8px;border-bottom:1px solid #e1e5ea;text-align:left}.message{margin-top:12px;padding:10px;border-radius:6px}.success{background:#ecfdf3}.error{background:#fef3f2}@media(max-width:800px){.grid{grid-template-columns:1fr}.full{grid-column:auto}.header{flex-direction:column}}</style></head><body>
+<div class="card"><div class="header"><div><h1>Настройка тестов</h1><div class="small">Тесты добавляются и изменяются через Web. YAML используется только для первоначального переноса существующих настроек.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div>
+<div class="card"><h2 id="formTitle">Добавить тест</h2><form id="form" class="grid"><div><label>Идентификатор</label><input id="id" required placeholder="new_test"></div><div><label>Название</label><input id="name" required></div><div><label>Активен</label><input id="enabled" type="checkbox" style="width:auto" checked></div><div><label>Режим</label><select id="mode"><option value="once">Однократно</option><option value="renewal">Повторное прохождение</option></select></div><div><label>Срок действия, дней</label><input id="validity" type="number" min="1" placeholder="Не задан"></div><div><label>Участники</label><select id="audience"><option value="all">Все действующие сотрудники</option><option value="explicit_list">Выборочный список</option></select></div><div><label>Подразделения для включения</label><textarea id="include" placeholder="* или по одному в строке">*</textarea></div><div><label>Исключаемые подразделения</label><textarea id="exclude" placeholder="По одному в строке"></textarea></div><div><label>Logical test ID Indigo</label><input id="logical" type="number"></div><div><label>Название теста в Indigo</label><input id="indigoName"></div><div><label>Успешные результаты</label><textarea id="success" placeholder="Отлично&#10;Хорошо"></textarea></div><div><label>Префиксы неуспешных результатов</label><textarea id="failed" placeholder="Требуется повторный"></textarea></div><div class="full"><button class="primary">Сохранить</button> <button id="cancel" type="button" hidden>Отмена</button></div></form><div id="message"></div></div>
+<div class="card"><h2>Тесты</h2><div class="table-wrap"><table><thead><tr><th>Название</th><th>ID</th><th>Участники</th><th>Indigo</th><th>Статус</th><th></th></tr></thead><tbody id="body"></tbody></table></div></div>
+<script>
+let items=[],editId=null;const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));async function api(u,o={}){const r=await fetch(u,o);let p={};try{p=await r.json()}catch(_){p={}}if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}const lines=v=>String(v||'').split(/
+?
+/).map(x=>x.trim()).filter(Boolean);function msg(t,k){message.textContent=t;message.className=`message ${k}`}function reset(){editId=null;form.reset();enabled.checked=true;include.value='*';id.disabled=false;cancel.hidden=true;formTitle.textContent='Добавить тест'}function fill(x){editId=x.id;id.value=x.id;id.disabled=true;name.value=x.name;enabled.checked=x.enabled;mode.value=x.mode||'once';validity.value=x.validity_days||'';audience.value=x.audience?'explicit_list':'all';include.value=(x.departments?.include||['*']).join('
+');exclude.value=(x.departments?.exclude||[]).join('
+');logical.value=x.indigo?.logical_test_id||'';indigoName.value=x.indigo?.test_name||x.name;success.value=(x.indigo?.success_results||[]).join('
+');failed.value=(x.indigo?.failed_result_prefixes||[]).join('
+');cancel.hidden=false;formTitle.textContent='Изменить тест';scrollTo(0,0)}function payload(){return {id:id.value.trim(),enabled:enabled.checked,name:name.value.trim(),mode:mode.value,validity_days:validity.value?Number(validity.value):null,audience_type:audience.value,departments_include:lines(include.value),departments_exclude:lines(exclude.value),indigo_logical_test_id:logical.value?Number(logical.value):null,indigo_test_name:indigoName.value.trim(),indigo_success_results:lines(success.value),indigo_failed_prefixes:lines(failed.value)}}function render(){body.innerHTML=items.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.id)}</td><td>${x.audience?'Выборочный список':'Все сотрудники'}</td><td>${esc(x.indigo?.logical_test_id||'–')} / ${esc(x.indigo?.test_name||'–')}</td><td>${x.enabled?'Активен':'Отключен'}</td><td><button data-edit="${esc(x.id)}">Изменить</button> <button class="danger" data-del="${esc(x.id)}">Удалить</button></td></tr>`).join('');document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>fill(items.find(x=>x.id===b.dataset.edit)));document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(confirm('Удалить тест? Используемый тест будет только отключен.')){const r=await api(`/api/settings/tests/${encodeURIComponent(b.dataset.del)}`,{method:'DELETE'});msg(r.detail||'Готово.','success');await load()}})}async function load(){items=(await api('/api/settings/tests')).items;render()}form.onsubmit=async e=>{e.preventDefault();try{await api(editId?`/api/settings/tests/${encodeURIComponent(editId)}`:'/api/settings/tests',{method:editId?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())});msg('Настройки теста сохранены.','success');reset();await load()}catch(e){msg(e.message,'error')}};cancel.onclick=reset;load().catch(e=>msg(e.message,'error'));
+</script></body></html>"""
 
 REVIEWERS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Контролирующие</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px}.link{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.link:hover{background:#f2f4f7}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}label{display:block;margin:5px 0;font-size:12px;font-weight:600}input{box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px;width:100%}.checks{display:flex;gap:14px;flex-wrap:wrap;padding:10px;border:1px solid #eaecf0;border-radius:7px}.checks label{font-weight:400}.checks input{width:auto}.button{padding:10px 14px;border:0;border-radius:7px;background:#175cd3;color:#fff;font-weight:600}.danger,.edit{padding:7px 10px;border:1px solid #98a2b3;border-radius:6px;background:#fff;cursor:pointer}.danger{color:#b42318;border-color:#f04438}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px 8px;border-bottom:1px solid #e1e5ea;text-align:left}.small{color:#667085;font-size:12px}.message{display:none;padding:12px;margin-top:12px}.success{display:block;background:#ecfdf3}.error{display:block;background:#fef3f2}@media(max-width:800px){.grid{grid-template-columns:1fr}.full{grid-column:auto}.header{flex-direction:column;gap:12px}}</style></head><body><div class="card"><div class="header"><div><h1>Контролирующие</h1><div class="small">Внутри системы сохраняется термин «проверяющие».</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div><div class="card"><h2 id="title">Добавить контролирующего</h2><form id="form" class="grid"><div><label>Наименование / ФИО</label><input id="name" required placeholder="Служба безопасности или Иванов И.И."></div><div><label>E-mail</label><input id="email" type="email" required></div><div class="full"><label>Контролируемые тесты</label><div id="templates" class="checks"></div></div><div class="full checks"><label><input id="technical" type="checkbox"> Получает технические ошибки</label><label><input id="enabled" type="checkbox" checked> Активен</label></div><div><button class="button">Сохранить</button> <button id="cancel" type="button" class="edit" hidden>Отмена</button></div></form><div id="message" class="message"></div></div><div class="card"><h2>Список контролирующих</h2><div class="table-wrap"><table><thead><tr><th>Наименование / ФИО</th><th>E-mail</th><th>Тесты</th><th>Технические ошибки</th><th>Статус</th><th></th></tr></thead><tbody id="body"></tbody></table></div></div><script>let items=[],templates=[],editId=null;const nameInput=document.getElementById('name'),emailInput=document.getElementById('email'),enabledInput=document.getElementById('enabled'),technicalInput=document.getElementById('technical'),formElement=document.getElementById('form'),titleElement=document.getElementById('title'),cancelButton=document.getElementById('cancel'),messageElement=document.getElementById('message'),bodyElement=document.getElementById('body');const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));async function api(u,o={}){const r=await fetch(u,o);let p={};try{p=await r.json()}catch(_){p={}}if(!r.ok)throw new Error(formatError(p,r.status));return p}function formatError(p,status){const d=p&&p.detail;if(typeof d==='string')return d;if(Array.isArray(d))return d.map(x=>{const field=Array.isArray(x.loc)?x.loc[x.loc.length-1]:'';return `${field?field+': ':''}${x.msg||JSON.stringify(x)}`}).join('; ');if(d&&typeof d==='object')return d.message||d.msg||JSON.stringify(d);return p.message||p.error||`HTTP ${status}`}function msg(t,k){messageElement.textContent=t;messageElement.className=`message ${k}`}function renderTemplates(selected=[]){document.getElementById('templates').innerHTML=templates.map(t=>`<label><input type="checkbox" data-template="${esc(t.id)}" ${selected.includes(String(t.id))?'checked':''}> ${esc(t.name)}</label>`).join('')}function selected(){return [...document.querySelectorAll('[data-template]:checked')].map(x=>x.dataset.template)}function reset(){editId=null;formElement.reset();enabledInput.checked=true;titleElement.textContent='Добавить контролирующего';cancelButton.hidden=true;renderTemplates([])}function render(){bodyElement.innerHTML=items.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.email)}</td><td>${esc(x.template_ids.map(id=>(templates.find(t=>String(t.id)===String(id))||{name:id}).name).join(', ')||'–')}</td><td>${x.receives_technical_errors?'Да':'Нет'}</td><td>${x.enabled?'Активен':'Отключен'}</td><td><button class="edit" data-edit="${x.id}">Изменить</button> <button class="danger" data-del="${x.id}">Удалить</button></td></tr>`).join('');document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{const x=items.find(i=>i.id==b.dataset.edit);editId=x.id;nameInput.value=x.name;emailInput.value=x.email;enabledInput.checked=!!x.enabled;technicalInput.checked=!!x.receives_technical_errors;renderTemplates(x.template_ids.map(String));titleElement.textContent='Изменить контролирующего';cancelButton.hidden=false;scrollTo(0,0)});document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(confirm('Удалить контролирующего?')){await api(`/api/reviewers/${b.dataset.del}`,{method:'DELETE'});await load()}})}async function load(){const p=await api('/api/reviewers');items=p.items;templates=p.templates;renderTemplates([]);render()}formElement.onsubmit=async e=>{e.preventDefault();try{await api(editId?`/api/reviewers/${editId}`:'/api/reviewers',{method:editId?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nameInput.value.trim(),email:emailInput.value.trim(),enabled:enabledInput.checked,receives_technical_errors:technicalInput.checked,template_ids:selected()})});reset();await load();msg('Контролирующий сохранен.','success')}catch(x){msg(x.message,'error')}};cancelButton.onclick=reset;load().catch(x=>msg(x.message,'error'))</script></body></html>"""
 

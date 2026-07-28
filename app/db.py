@@ -174,6 +174,24 @@ CREATE TABLE IF NOT EXISTS reviewer_templates (
     FOREIGN KEY(reviewer_id) REFERENCES reviewers(id) ON DELETE CASCADE
 );
 
+
+CREATE TABLE IF NOT EXISTS test_definitions (
+    id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    name TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'once',
+    validity_days INTEGER,
+    audience_type TEXT NOT NULL DEFAULT 'all',
+    departments_include_json TEXT NOT NULL DEFAULT '["*"]',
+    departments_exclude_json TEXT NOT NULL DEFAULT '[]',
+    indigo_logical_test_id INTEGER,
+    indigo_test_name TEXT,
+    indigo_success_results_json TEXT NOT NULL DEFAULT '[]',
+    indigo_failed_prefixes_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS notification_journal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,

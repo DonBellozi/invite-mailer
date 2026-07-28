@@ -8,6 +8,7 @@ from typing import Any
 
 from .db import Database
 from .settings import Settings
+from .test_catalog import load_test_definitions
 
 
 LOGGER = logging.getLogger("invite-mailer.indigo")
@@ -48,6 +49,7 @@ def configured_indigo_templates(settings: Settings) -> list[dict]:
 
 
 def sync_indigo_results(settings: Settings, db: Database) -> int:
+    settings.templates[:] = load_test_definitions(settings, db)
     if not settings.indigo.enabled:
         return 0
 

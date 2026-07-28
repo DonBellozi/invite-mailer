@@ -18,6 +18,7 @@ from .mailer import send_html_email
 from .mail_templates import ensure_mail_templates, render_mail_template
 from .report import build_report
 from .settings import Settings
+from .test_catalog import load_test_definitions
 from .technical_alerts import notify_technical_error
 from .xlsx_parser import EmployeeRecord, parse_xlsx
 
@@ -307,6 +308,7 @@ def fetch_and_import(settings: Settings, db: Database) -> Path:
 
 
 def send_notifications(settings: Settings, db: Database, dry_run: bool = False) -> dict:
+    settings.templates[:] = load_test_definitions(settings, db)
     try_sync_indigo_results(settings, db)
     start = datetime.now()
     ensure_mail_templates(db, settings.templates)
@@ -442,6 +444,7 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
 
 
 def seed_manual(settings: Settings, db: Database, template_ids: list[str], sent_date: str) -> int:
+    settings.templates[:] = load_test_definitions(settings, db)
     timestamp = datetime.fromisoformat(sent_date).replace(hour=12, minute=0, second=0).isoformat()
     templates_by_id = {template["id"]: template for template in settings.templates}
     unknown = set(template_ids) - set(templates_by_id)
@@ -487,6 +490,7 @@ def seed_manual(settings: Settings, db: Database, template_ids: list[str], sent_
 
 
 def rebuild_report(settings: Settings, db: Database, sync_indigo: bool = True) -> Path:
+    settings.templates[:] = load_test_definitions(settings, db)
     if sync_indigo:
         try_sync_indigo_results(settings, db)
     output = settings.reports_path / "index.html"

@@ -9,6 +9,7 @@ from .db import Database
 from .mailer import send_html_email
 from .mail_templates import ensure_mail_templates, render_mail_template
 from .settings import Settings
+from .test_catalog import load_test_definitions
 
 LOGGER = logging.getLogger("invite-mailer.technical-alerts")
 
@@ -62,6 +63,7 @@ def notify_technical_error(
     error_type: str,
     error_text: str = "",
 ) -> bool:
+    settings.templates[:] = load_test_definitions(settings, db)
     config = technical_settings(db)
     now = utc_now()
     now_iso = now.isoformat()

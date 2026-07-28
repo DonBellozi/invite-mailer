@@ -13,6 +13,7 @@ from .indigo import summarize_employee_result, try_sync_indigo_results
 from .mailer import send_html_email
 from .mail_templates import ensure_mail_templates, render_mail_template
 from .settings import Settings
+from .test_catalog import load_test_definitions
 from .technical_alerts import notify_technical_error
 
 LOGGER = logging.getLogger("invite-mailer.reminders")
@@ -113,6 +114,7 @@ def _reviewer_body(row, template_name: str) -> str:
 
 def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                                               template_ids: set[str] | None = None) -> dict:
+    settings.templates[:] = load_test_definitions(settings, db)
     ensure_mail_templates(db, settings.templates)
     templates = {str(t["id"]): t for t in settings.templates}
     summary = {"delivered": 0, "pending": 0, "errors": 0}
@@ -221,6 +223,7 @@ def cleanup_journal(db: Database) -> int:
 
 
 def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -> dict:
+    settings.templates[:] = load_test_definitions(settings, db)
     ensure_mail_templates(db, settings.templates)
     try_sync_indigo_results(settings, db)
     now = utc_now()
