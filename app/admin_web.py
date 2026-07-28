@@ -90,9 +90,6 @@ def _ensure_v202_schema(db: Database) -> None:
             "reminders_enabled": "1",
             "reminder_interval_days": "7",
             "reviewer_notifications_enabled": "1",
-            "technical_notifications_enabled": "0",
-            "technical_email": "",
-            "technical_repeat_hours": "72",
         }
         now = _utc_now()
         for key, value in defaults.items():
@@ -191,12 +188,6 @@ class ReviewerRequest(BaseModel):
     enabled: bool = True
 
 
-class TechnicalSettingsRequest(BaseModel):
-    enabled: bool
-    email: str
-    repeat_hours: int = 72
-
-
 def find_report_template(
     template_id: str,
 ) -> dict:
@@ -238,11 +229,6 @@ def reviewers_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return REVIEWERS_HTML
 
 
-@app.get("/admin/settings/technical/", response_class=HTMLResponse)
-def technical_settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
-    return TECHNICAL_SETTINGS_HTML
-
-
 @app.get("/admin/logins/", response_class=HTMLResponse)
 def login_overrides_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return LOGIN_OVERRIDES_HTML
@@ -276,31 +262,6 @@ def write_reminder_settings(
         "1" if request.notify_reviewers else "0",
     )
     return read_reminder_settings(_)
-
-
-@app.get("/api/settings/technical")
-def read_technical_settings(_: Annotated[str, Depends(require_admin)]):
-    return {
-        "enabled": _read_setting("technical_notifications_enabled", "0") == "1",
-        "email": _read_setting("technical_email", ""),
-        "repeat_hours": int(_read_setting("technical_repeat_hours", "72")),
-    }
-
-
-@app.put("/api/settings/technical")
-def write_technical_settings(
-    request: TechnicalSettingsRequest,
-    _: Annotated[str, Depends(require_admin)],
-):
-    email = request.email.strip().lower()
-    if request.enabled and ("@" not in email or email.startswith("@") or email.endswith("@")):
-        raise HTTPException(status_code=400, detail="Укажите корректный технический e-mail")
-    if request.repeat_hours < 1 or request.repeat_hours > 8760:
-        raise HTTPException(status_code=400, detail="Интервал должен быть от 1 до 8760 часов")
-    _write_setting("technical_notifications_enabled", "1" if request.enabled else "0")
-    _write_setting("technical_email", email)
-    _write_setting("technical_repeat_hours", str(request.repeat_hours))
-    return read_technical_settings(_)
 
 
 @app.get("/api/reviewers")
@@ -814,18 +775,6 @@ h1 {
     </div>
   </section>
 
-
-  <section class="settings-item">
-    <h2>Технические уведомления</h2>
-    <p>
-      Немедленные сообщения об ошибках данных и SMTP
-      с защитой от повторов в течение 72 часов.
-    </p>
-    <div class="item-action">
-      <a class="settings-link" href="/admin/settings/technical/">Открыть настройки</a>
-    </div>
-  </section>
-
   <section class="settings-item">
     <h2>Шаблоны</h2>
     <p>
@@ -872,25 +821,6 @@ body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.car
 let items=[],editId=null;function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}async function api(u,o={}){const r=await fetch(u,o);const p=await r.json();if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}function msg(t,k){const n=document.getElementById('message');n.textContent=t;n.className=`message ${k}`}function fmt(v){if(!v)return'';const d=new Date(v);return Number.isNaN(d.getTime())?v:d.toLocaleString('ru-RU')}
 function render(){document.getElementById('count').textContent=`Проверяющих: ${items.length}`;document.getElementById('body').innerHTML=items.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.email)}</td><td>${x.enabled?'Активен':'Отключен'}</td><td>${esc(fmt(x.updated_at))}</td><td><button class="danger" data-id="${x.id}">Удалить</button></td></tr>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('Удалить проверяющего?'))return;try{await api(`/api/reviewers/${b.dataset.id}`,{method:'DELETE'});await load();msg('Проверяющий удален.','success')}catch(e){msg(e.message,'error')}}))}
 async function load(){const p=await api('/api/reviewers');items=p.items;render()}document.getElementById('form').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/reviewers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('name').value,email:document.getElementById('email').value,enabled:document.getElementById('enabled').checked})});e.target.reset();document.getElementById('enabled').checked=true;await load();msg('Проверяющий сохранен.','success')}catch(error){msg(error.message,'error')}});load().catch(e=>msg(e.message,'error'));
-</script></body></html>"""
-
-
-TECHNICAL_SETTINGS_HTML = r"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Технические уведомления</title>
-<style>
-body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 14px;font-size:18px}.header{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.actions{display:flex;gap:10px;flex-wrap:wrap}.link{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;font-size:13px;font-weight:600;background:#fff}.small{color:#667085;font-size:12px}.form{max-width:760px}.row{display:grid;grid-template-columns:1fr 260px;gap:16px;align-items:center;padding:14px 0;border-bottom:1px solid #eaecf0}.row:last-child{border-bottom:0}label{font-weight:600}.hint{margin-top:4px;color:#667085;font-size:12px;line-height:1.4}input[type=email],input[type=number]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}input[type=checkbox]{width:20px;height:20px}.save{margin-top:18px;padding:10px 16px;border:0;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.message{display:none;margin-top:14px;padding:12px;border-radius:7px}.message.success{display:block;background:#ecfdf3;color:#05603a}.message.error{display:block;background:#fef3f2;color:#912018}@media(max-width:720px){.header{flex-direction:column}.row{grid-template-columns:1fr}.actions{width:100%}.link{flex:1}}
-</style></head><body>
-<div class="card"><div class="header"><div><h1>Технические уведомления</h1><div class="small">Ошибки данных отправляются сразу после импорта, ошибки SMTP – сразу после неудачной попытки отправки.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div>
-<div class="card"><h2>Параметры</h2><form id="form" class="form">
-<div class="row"><div><label for="enabled">Отправлять технические уведомления</label><div class="hint">При отключении ошибки продолжают записываться в базу, но письмо не отправляется.</div></div><input id="enabled" type="checkbox"></div>
-<div class="row"><div><label for="email">Технический e-mail</label><div class="hint">Адрес для немедленных сообщений об ошибках файла 1С и SMTP.</div></div><input id="email" type="email" placeholder="it@example.ru"></div>
-<div class="row"><div><label for="repeat">Повтор одинаковой ошибки</label><div class="hint">Одинаковая ошибка повторно отправляется не раньше указанного интервала. Рекомендуемое значение – 72 часа.</div></div><input id="repeat" type="number" min="1" max="8760" required></div>
-<button class="save" type="submit">Сохранить</button><div id="message" class="message"></div></form></div>
-<script>
-async function api(url,options={}){const r=await fetch(url,options);const p=await r.json();if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}function msg(t,k){const n=document.getElementById('message');n.textContent=t;n.className=`message ${k}`}
-async function load(){const p=await api('/api/settings/technical');document.getElementById('enabled').checked=p.enabled;document.getElementById('email').value=p.email;document.getElementById('repeat').value=p.repeat_hours}
-document.getElementById('form').addEventListener('submit',async e=>{e.preventDefault();try{const p=await api('/api/settings/technical',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:document.getElementById('enabled').checked,email:document.getElementById('email').value,repeat_hours:Number(document.getElementById('repeat').value)})});msg(`Настройки сохранены. Повтор одинаковой ошибки – через ${p.repeat_hours} ч.`,'success')}catch(error){msg(error.message,'error')}});load().catch(e=>msg(e.message,'error'));
 </script></body></html>"""
 
 
