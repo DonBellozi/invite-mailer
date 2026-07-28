@@ -867,6 +867,7 @@ def _reviewer_test_context(db: Database) -> tuple[dict, str, int]:
                     "position": str(row["position"] or "Не указана"),
                     "reminder_count": int(row["reminder_count"] or 0),
                     "first_reminder_at": _display_timestamp(row["first_reminder_at"]),
+                    "first_invited_at": _display_timestamp(row["first_reminder_at"]),
                     "last_reminder_at": _display_timestamp(row["last_reminder_at"]),
                 }
                 for row in selected_rows
@@ -900,6 +901,7 @@ def _reviewer_test_context(db: Database) -> tuple[dict, str, int]:
                 "position": str(employee["position"] or "Не указана"),
                 "reminder_count": 3,
                 "first_reminder_at": (now - timedelta(days=14)).strftime("%d.%m.%Y %H:%M:%S"),
+                "first_invited_at": (now - timedelta(days=14)).strftime("%d.%m.%Y %H:%M:%S"),
                 "last_reminder_at": now.strftime("%d.%m.%Y %H:%M:%S"),
             }
             for employee in employee_rows
@@ -922,6 +924,7 @@ def _reviewer_test_context(db: Database) -> tuple[dict, str, int]:
             "position": "Тестовая должность",
             "reminder_count": 3,
             "first_reminder_at": "01.07.2026 09:00:00",
+            "first_invited_at": "01.07.2026 09:00:00",
             "last_reminder_at": "15.07.2026 09:00:00",
         },
         {
@@ -931,6 +934,7 @@ def _reviewer_test_context(db: Database) -> tuple[dict, str, int]:
             "position": "Ведущий специалист",
             "reminder_count": 3,
             "first_reminder_at": "02.07.2026 09:00:00",
+            "first_invited_at": "02.07.2026 09:00:00",
             "last_reminder_at": "16.07.2026 09:00:00",
         },
     ]

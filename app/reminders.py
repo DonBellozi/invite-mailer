@@ -178,6 +178,7 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                         "position": row["position"] or "Не указана",
                         "reminder_count": int(row["reminder_count"] or 0),
                         "first_reminder_at": row["first_reminder_at"] or "Не указано",
+                        "first_invited_at": row["first_reminder_at"] or "Не указано",
                         "last_reminder_at": row["last_reminder_at"] or "Не указано",
                     }
                     for row in unsent_rows
