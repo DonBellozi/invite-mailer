@@ -21,6 +21,7 @@ from .logic import (
     send_notifications,
 )
 from .settings import load_settings
+from .reminders import process_reminders
 
 
 logging.basicConfig(
@@ -38,6 +39,9 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("fetch")
     commands.add_parser("report")
     commands.add_parser("indigo-sync")
+
+    reminders = commands.add_parser("reminders")
+    reminders.add_argument("--dry-run", action="store_true")
 
     run = commands.add_parser("run")
     run.add_argument("--dry-run", action="store_true")
@@ -58,8 +62,9 @@ def scheduler_mode(settings, db: Database) -> None:
     def fetch_job():
         try:
             path = fetch_and_import(settings, db)
-            rebuild_report(settings, db)
-            LOGGER.info("XLSX обработан: %s", path)
+            reminder_summary = process_reminders(settings, db, dry_run=False)
+            rebuild_report(settings, db, sync_indigo=False)
+            LOGGER.info("XLSX обработан: %s; напоминания: %s", path, json.dumps(reminder_summary, ensure_ascii=False))
         except Exception:
             LOGGER.exception("Ошибка ежедневного получения XLSX")
 
@@ -164,6 +169,12 @@ def main() -> int:
 
     if args.command == "report":
         print(rebuild_report(settings, db))
+        return 0
+
+    if args.command == "reminders":
+        summary = process_reminders(settings, db, dry_run=args.dry_run)
+        rebuild_report(settings, db, sync_indigo=False)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
     if args.command == "indigo-sync":

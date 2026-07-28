@@ -29,6 +29,7 @@ from .identity import (
     save_override,
 )
 from .logic import rebuild_report
+from .reminders import dispatch_pending_reviewer_notifications
 from .settings import Settings, load_settings
 
 from .report_export import (
@@ -411,6 +412,8 @@ def create_reviewer(request: ReviewerRequest, _: Annotated[str, Depends(require_
         if "UNIQUE" in str(error).upper():
             raise HTTPException(status_code=400, detail="Контролирующий с таким e-mail уже добавлен") from error
         raise
+    if request.enabled and request.template_ids:
+        dispatch_pending_reviewer_notifications(settings(), database(), set(request.template_ids))
     return read_reviewers(_)
 
 
@@ -441,6 +444,8 @@ def update_reviewer(reviewer_id: int, request: ReviewerRequest, _: Annotated[str
         if "UNIQUE" in str(error).upper():
             raise HTTPException(status_code=400, detail="Контролирующий с таким e-mail уже добавлен") from error
         raise
+    if request.enabled and request.template_ids:
+        dispatch_pending_reviewer_notifications(settings(), database(), set(request.template_ids))
     return read_reviewers(_)
 
 

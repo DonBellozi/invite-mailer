@@ -425,6 +425,7 @@ def _row_status(
     employee,
     latest,
     result: ResultSummary,
+    escalation=None,
 ) -> tuple[str, str, str]:
     if not employee["active"]:
         return (
@@ -450,6 +451,13 @@ def _row_status(
             "Не прошел",
             "status-failed",
             "failed",
+        )
+
+    if escalation:
+        return (
+            "Игнорирует прохождение",
+            "status-error",
+            "ignoring",
         )
 
     if not employee["email"]:
@@ -680,6 +688,12 @@ def build_report(
                     employee,
                     template,
                 )
+                escalation = connection.execute(
+                    """SELECT id FROM reviewer_notification_queue
+                       WHERE worker_key = ? AND employment_seq = ? AND template_id = ?
+                       LIMIT 1""",
+                    (employee["worker_key"], employee["employment_seq"], template["id"]),
+                ).fetchone()
 
                 (
                     status,
@@ -689,6 +703,7 @@ def build_report(
                     employee,
                     latest,
                     result,
+                    escalation,
                 )
 
                 if status_key == "error":
@@ -815,6 +830,7 @@ def build_report(
 <option value="">Все статусы</option>
 <option value="completed">Пройден</option>
 <option value="failed">Не прошел</option>
+<option value="ignoring">Игнорирует прохождение</option>
 <option value="sent">Отправлено, ожидает выполнения</option>
 <option value="waiting">Ожидает отправки</option>
 <option value="error">Ошибка отправки</option>

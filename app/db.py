@@ -198,6 +198,45 @@ ON notification_journal(created_at);
 CREATE INDEX IF NOT EXISTS idx_notification_journal_lookup
 ON notification_journal(template_id, worker_key, employment_seq, event_type);
 
+CREATE TABLE IF NOT EXISTS reviewer_notification_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_key TEXT NOT NULL,
+    employment_seq INTEGER NOT NULL,
+    template_id TEXT NOT NULL,
+    fio TEXT,
+    email TEXT,
+    department TEXT,
+    position TEXT,
+    reminder_count INTEGER NOT NULL,
+    first_reminder_at TEXT,
+    last_reminder_at TEXT,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    delivered_at TEXT,
+    last_error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(worker_key, employment_seq, template_id),
+    FOREIGN KEY(worker_key) REFERENCES employees(worker_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reviewer_queue_status
+ON reviewer_notification_queue(status, template_id, created_at);
+
+CREATE TABLE IF NOT EXISTS reviewer_delivery_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_id INTEGER NOT NULL,
+    reviewer_id INTEGER NOT NULL,
+    recipient_email TEXT NOT NULL,
+    attempted_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_text TEXT,
+    FOREIGN KEY(queue_id) REFERENCES reviewer_notification_queue(id) ON DELETE CASCADE,
+    FOREIGN KEY(reviewer_id) REFERENCES reviewers(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_reviewer_delivery_queue
+ON reviewer_delivery_attempts(queue_id, reviewer_id, status);
+
 CREATE TABLE IF NOT EXISTS technical_errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     fingerprint TEXT NOT NULL,
