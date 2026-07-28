@@ -43,7 +43,7 @@ PDF_MEDIA_TYPE = "application/pdf"
 @dataclass(frozen=True)
 class ExportRow:
     fio: str
-    login: str
+    email: str
     department: str
     position: str
     status: str
