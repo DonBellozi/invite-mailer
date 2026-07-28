@@ -23,6 +23,7 @@ from .logic import (
 )
 from .settings import load_settings
 from .reminders import process_reminders
+from .technical_alerts import dispatch_technical_error_digest
 
 
 logging.basicConfig(
@@ -71,6 +72,7 @@ def scheduler_mode(settings, db: Database) -> None:
     def send_job():
         try:
             summary = run_full(settings, db, dry_run=False)
+            summary["technical_digest"] = dispatch_technical_error_digest(settings, db)
             LOGGER.info("Рассылка завершена: %s", json.dumps(summary, ensure_ascii=False))
         except Exception:
             LOGGER.exception("Ошибка еженедельной рассылки")
@@ -83,18 +85,22 @@ def scheduler_mode(settings, db: Database) -> None:
                 values = {
                     row["key"]: row["value"]
                     for row in connection.execute(
-                        "SELECT key, value FROM app_settings WHERE key IN ('reminders_enabled','reminder_run_hour','reminder_run_minute','reminder_last_auto_run')"
+                        "SELECT key, value FROM app_settings WHERE key IN ('reminders_enabled','reminder_run_hour','reminder_run_minute','reminder_run_day_of_week','reminder_last_auto_run')"
                     ).fetchall()
                 }
             if values.get("reminders_enabled", "1") != "1":
                 return
             hour = int(values.get("reminder_run_hour", "9"))
             minute = int(values.get("reminder_run_minute", "15"))
+            day_of_week = int(values.get("reminder_run_day_of_week", "6"))
+            if local_now.weekday() != day_of_week:
+                return
             if (local_now.hour, local_now.minute) < (hour, minute):
                 return
             if values.get("reminder_last_auto_run") == today:
                 return
             summary = process_reminders(settings, db, dry_run=False)
+            summary["technical_digest"] = dispatch_technical_error_digest(settings, db)
             with db.connect() as connection:
                 connection.execute(
                     "INSERT INTO app_settings(key,value,updated_at) VALUES('reminder_last_auto_run',?,?) "

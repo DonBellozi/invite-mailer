@@ -12,6 +12,7 @@ def send_html_email(
     recipient: str,
     subject: str,
     html_body: str,
+    attachments: list[tuple[str, bytes, str, str]] | None = None,
 ) -> None:
     message = EmailMessage()
     message["From"] = formataddr((settings.from_name, settings.from_email))
@@ -19,6 +20,8 @@ def send_html_email(
     message["Subject"] = subject
     message.set_content("Для просмотра письма требуется почтовый клиент с поддержкой HTML.")
     message.add_alternative(html_body, subtype="html")
+    for filename, content, maintype, subtype in attachments or []:
+        message.add_attachment(content, maintype=maintype, subtype=subtype, filename=filename)
 
     if settings.mode == "ssl":
         smtp = smtplib.SMTP_SSL(settings.host, settings.port, timeout=30)
