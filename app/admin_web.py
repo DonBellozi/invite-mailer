@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import secrets
+from datetime import timedelta
 from datetime import datetime, timezone
 from typing import Annotated
 
@@ -10,6 +11,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, sta
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
+from openpyxl import Workbook
 
 from .audience import (
     AudienceImportError,
@@ -90,6 +92,11 @@ def _ensure_v202_schema(db: Database) -> None:
             "reminders_enabled": "1",
             "reminder_interval_days": "7",
             "reviewer_notifications_enabled": "1",
+            "technical_notifications_enabled": "0",
+            "technical_email": "",
+            "technical_repeat_hours": "72",
+            "max_reminders": "10",
+            "journal_retention_days": "365",
         }
         now = _utc_now()
         for key, value in defaults.items():
@@ -180,12 +187,22 @@ class ReminderSettingsRequest(BaseModel):
     enabled: bool
     interval_days: int
     notify_reviewers: bool
+    max_reminders: int
+    journal_retention_days: int
 
 
 class ReviewerRequest(BaseModel):
     name: str
     email: str
     enabled: bool = True
+    template_ids: list[str] = []
+    receives_technical_errors: bool = False
+
+
+class TechnicalSettingsRequest(BaseModel):
+    enabled: bool
+    email: str
+    repeat_hours: int = 72
 
 
 def find_report_template(
@@ -229,6 +246,16 @@ def reviewers_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return REVIEWERS_HTML
 
 
+@app.get("/admin/settings/technical/", response_class=HTMLResponse)
+def technical_settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
+    return TECHNICAL_SETTINGS_HTML
+
+
+@app.get("/admin/journal/", response_class=HTMLResponse)
+def journal_page(_: Annotated[str, Depends(require_admin)]) -> str:
+    return JOURNAL_HTML
+
+
 @app.get("/admin/logins/", response_class=HTMLResponse)
 def login_overrides_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return LOGIN_OVERRIDES_HTML
@@ -242,6 +269,8 @@ def read_reminder_settings(_: Annotated[str, Depends(require_admin)]):
         "notify_reviewers": _read_setting(
             "reviewer_notifications_enabled", "1"
         ) == "1",
+        "max_reminders": int(_read_setting("max_reminders", "10")),
+        "journal_retention_days": int(_read_setting("journal_retention_days", "365")),
     }
 
 
@@ -257,11 +286,42 @@ def write_reminder_settings(
         )
     _write_setting("reminders_enabled", "1" if request.enabled else "0")
     _write_setting("reminder_interval_days", str(request.interval_days))
+    if request.max_reminders < 1 or request.max_reminders > 100:
+        raise HTTPException(status_code=400, detail="Количество напоминаний должно быть от 1 до 100")
+    if request.journal_retention_days < 30 or request.journal_retention_days > 3650:
+        raise HTTPException(status_code=400, detail="Срок хранения журнала должен быть от 30 до 3650 дней")
     _write_setting(
         "reviewer_notifications_enabled",
         "1" if request.notify_reviewers else "0",
     )
+    _write_setting("max_reminders", str(request.max_reminders))
+    _write_setting("journal_retention_days", str(request.journal_retention_days))
     return read_reminder_settings(_)
+
+
+@app.get("/api/settings/technical")
+def read_technical_settings(_: Annotated[str, Depends(require_admin)]):
+    return {
+        "enabled": _read_setting("technical_notifications_enabled", "0") == "1",
+        "email": _read_setting("technical_email", ""),
+        "repeat_hours": int(_read_setting("technical_repeat_hours", "72")),
+    }
+
+
+@app.put("/api/settings/technical")
+def write_technical_settings(
+    request: TechnicalSettingsRequest,
+    _: Annotated[str, Depends(require_admin)],
+):
+    email = request.email.strip().lower()
+    if request.enabled and ("@" not in email or email.startswith("@") or email.endswith("@")):
+        raise HTTPException(status_code=400, detail="Укажите корректный технический e-mail")
+    if request.repeat_hours < 1 or request.repeat_hours > 8760:
+        raise HTTPException(status_code=400, detail="Интервал должен быть от 1 до 8760 часов")
+    _write_setting("technical_notifications_enabled", "1" if request.enabled else "0")
+    _write_setting("technical_email", email)
+    _write_setting("technical_repeat_hours", str(request.repeat_hours))
+    return read_technical_settings(_)
 
 
 @app.get("/api/reviewers")
@@ -269,23 +329,49 @@ def read_reviewers(_: Annotated[str, Depends(require_admin)]):
     with database().connect() as connection:
         rows = connection.execute(
             """
-            SELECT id, name, email, enabled, created_at, updated_at
+            SELECT id, name, email, enabled, receives_technical_errors,
+                   created_at, updated_at
             FROM reviewers
             ORDER BY enabled DESC, name COLLATE NOCASE, email COLLATE NOCASE
             """
         ).fetchall()
-    return {"items": [dict(row) for row in rows]}
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["template_ids"] = [
+                str(template_row["template_id"])
+                for template_row in connection.execute(
+                    "SELECT template_id FROM reviewer_templates WHERE reviewer_id = ? ORDER BY template_id",
+                    (row["id"],),
+                ).fetchall()
+            ]
+            items.append(item)
+    templates = [
+        {"id": str(template["id"]), "name": template.get("name", template["id"])}
+        for template in settings().templates
+    ]
+    return {"items": items, "templates": templates}
+
+
+def _save_reviewer_templates(connection, reviewer_id: int, template_ids: list[str]) -> None:
+    allowed = {str(template["id"]) for template in settings().templates}
+    normalized = sorted({str(value).strip() for value in template_ids if str(value).strip()})
+    unknown = set(normalized) - allowed
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Неизвестные тесты: {', '.join(sorted(unknown))}")
+    connection.execute("DELETE FROM reviewer_templates WHERE reviewer_id = ?", (reviewer_id,))
+    connection.executemany(
+        "INSERT INTO reviewer_templates(reviewer_id, template_id) VALUES (?, ?)",
+        [(reviewer_id, template_id) for template_id in normalized],
+    )
 
 
 @app.post("/api/reviewers")
-def create_reviewer(
-    request: ReviewerRequest,
-    _: Annotated[str, Depends(require_admin)],
-):
+def create_reviewer(request: ReviewerRequest, _: Annotated[str, Depends(require_admin)]):
     name = request.name.strip()
     email = request.email.strip().lower()
     if not name:
-        raise HTTPException(status_code=400, detail="Укажите имя проверяющего")
+        raise HTTPException(status_code=400, detail="Укажите имя контролирующего")
     if "@" not in email or email.startswith("@") or email.endswith("@"):
         raise HTTPException(status_code=400, detail="Некорректный e-mail")
     now = _utc_now()
@@ -293,41 +379,26 @@ def create_reviewer(
         with database().connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO reviewers (
-                    name, email, enabled, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
+                INSERT INTO reviewers(name, email, enabled, receives_technical_errors, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (name, email, int(request.enabled), now, now),
+                (name, email, int(request.enabled), int(request.receives_technical_errors), now, now),
             )
-            connection.commit()
-            reviewer_id = cursor.lastrowid
-            row = connection.execute(
-                """
-                SELECT id, name, email, enabled, created_at, updated_at
-                FROM reviewers WHERE id = ?
-                """,
-                (reviewer_id,),
-            ).fetchone()
+            reviewer_id = int(cursor.lastrowid)
+            _save_reviewer_templates(connection, reviewer_id, request.template_ids)
     except Exception as error:
         if "UNIQUE" in str(error).upper():
-            raise HTTPException(
-                status_code=400,
-                detail="Проверяющий с таким e-mail уже добавлен",
-            ) from error
+            raise HTTPException(status_code=400, detail="Контролирующий с таким e-mail уже добавлен") from error
         raise
-    return dict(row)
+    return read_reviewers(_)
 
 
 @app.put("/api/reviewers/{reviewer_id}")
-def update_reviewer(
-    reviewer_id: int,
-    request: ReviewerRequest,
-    _: Annotated[str, Depends(require_admin)],
-):
+def update_reviewer(reviewer_id: int, request: ReviewerRequest, _: Annotated[str, Depends(require_admin)]):
     name = request.name.strip()
     email = request.email.strip().lower()
     if not name:
-        raise HTTPException(status_code=400, detail="Укажите имя проверяющего")
+        raise HTTPException(status_code=400, detail="Укажите имя контролирующего")
     if "@" not in email or email.startswith("@") or email.endswith("@"):
         raise HTTPException(status_code=400, detail="Некорректный e-mail")
     try:
@@ -335,45 +406,81 @@ def update_reviewer(
             cursor = connection.execute(
                 """
                 UPDATE reviewers
-                SET name = ?, email = ?, enabled = ?, updated_at = ?
+                SET name = ?, email = ?, enabled = ?, receives_technical_errors = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (name, email, int(request.enabled), _utc_now(), reviewer_id),
+                (name, email, int(request.enabled), int(request.receives_technical_errors), _utc_now(), reviewer_id),
             )
             if cursor.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Проверяющий не найден")
-            connection.commit()
-            row = connection.execute(
-                """
-                SELECT id, name, email, enabled, created_at, updated_at
-                FROM reviewers WHERE id = ?
-                """,
-                (reviewer_id,),
-            ).fetchone()
+                raise HTTPException(status_code=404, detail="Контролирующий не найден")
+            _save_reviewer_templates(connection, reviewer_id, request.template_ids)
     except HTTPException:
         raise
     except Exception as error:
         if "UNIQUE" in str(error).upper():
-            raise HTTPException(
-                status_code=400,
-                detail="Проверяющий с таким e-mail уже добавлен",
-            ) from error
+            raise HTTPException(status_code=400, detail="Контролирующий с таким e-mail уже добавлен") from error
         raise
-    return dict(row)
+    return read_reviewers(_)
 
 
 @app.delete("/api/reviewers/{reviewer_id}")
-def delete_reviewer(
-    reviewer_id: int,
-    _: Annotated[str, Depends(require_admin)],
-):
+def delete_reviewer(reviewer_id: int, _: Annotated[str, Depends(require_admin)]):
     with database().connect() as connection:
-        cursor = connection.execute(
-            "DELETE FROM reviewers WHERE id = ?",
-            (reviewer_id,),
-        )
-        connection.commit()
+        cursor = connection.execute("DELETE FROM reviewers WHERE id = ?", (reviewer_id,))
     return {"deleted": cursor.rowcount > 0}
+
+
+@app.get("/api/journal")
+def read_journal(_: Annotated[str, Depends(require_admin)], limit: int = 500):
+    limit = max(1, min(limit, 5000))
+    with database().connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, created_at, event_type, fio, email, department, position,
+                   template_name, reminder_number, recipient, status, details
+            FROM notification_journal
+            ORDER BY id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}
+
+
+@app.get("/api/journal/export.xlsx")
+def export_journal(_: Annotated[str, Depends(require_admin)]):
+    with database().connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT created_at, event_type, fio, email, department, position,
+                   template_name, reminder_number, recipient, status, details
+            FROM notification_journal ORDER BY id DESC
+            """
+        ).fetchall()
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Журнал уведомлений"
+    sheet.append(["Дата", "Событие", "ФИО", "E-mail", "Подразделение", "Должность", "Тест", "Напоминание", "Получатель", "Статус", "Подробности"])
+    for row in rows:
+        sheet.append(list(row))
+    for column in sheet.columns:
+        sheet.column_dimensions[column[0].column_letter].width = min(60, max(12, max(len(str(cell.value or "")) for cell in column) + 2))
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="notification_journal.xlsx"'},
+    )
+
+
+@app.post("/api/journal/cleanup")
+def cleanup_journal(_: Annotated[str, Depends(require_admin)]):
+    retention = int(_read_setting("journal_retention_days", "365"))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention)).replace(microsecond=0).isoformat()
+    with database().connect() as connection:
+        cursor = connection.execute("DELETE FROM notification_journal WHERE created_at < ?", (cutoff,))
+    return {"deleted": cursor.rowcount, "retention_days": retention}
 
 
 @app.get("/api/login-overrides")
@@ -550,278 +657,35 @@ def health():
     return {"status": "ok"}
 
 
-SETTINGS_HTML = r"""<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Настройки</title>
-<style>
-body {
-  font-family: Arial, sans-serif;
-  margin: 24px;
-  color: #222;
-  background: #f5f6f8;
-}
-
-.card {
-  background: #fff;
-  border-radius: 10px;
-  padding: 18px;
-  margin-bottom: 18px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, .08);
-}
-
-.page-header {
-  display: flex;
-  align-items: stretch;
-  gap: 0;
-}
-
-.page-header-main {
-  flex: 1 1 auto;
-  min-width: 360px;
-  padding-right: 18px;
-  box-sizing: border-box;
-}
-
-.page-header-actions {
-  flex: 0 0 190px;
-  min-width: 190px;
-  padding-left: 18px;
-  border-left: 2px solid #e5e7eb;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  box-sizing: border-box;
-}
-
-.header-button {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  min-height: 38px;
-  box-sizing: border-box;
-  padding: 9px 13px;
-  border: 1px solid #98a2b3;
-  border-radius: 7px;
-  color: #344054;
-  text-decoration: none;
-  text-align: center;
-  font-size: 13px;
-  font-weight: 600;
-  background: #fff;
-}
-
-.header-button:hover {
-  background: #f2f4f7;
-}
-
-h1 {
-  margin: 0 0 8px;
-  font-size: 24px;
-}
-
-.small {
-  color: #667085;
-  font-size: 12px;
-}
-
-.settings-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(280px, 1fr));
-  gap: 18px;
-}
-
-.settings-item {
-  display: flex;
-  flex-direction: column;
-  min-height: 160px;
-  padding: 18px;
-  border: 1px solid #e1e5ea;
-  border-radius: 10px;
-  background: #fff;
-  box-sizing: border-box;
-}
-
-.settings-item h2 {
-  margin: 0 0 8px;
-  font-size: 18px;
-}
-
-.settings-item p {
-  margin: 0 0 18px;
-  color: #667085;
-  font-size: 13px;
-  line-height: 1.45;
-}
-
-.settings-item .item-action {
-  margin-top: auto;
-}
-
-.settings-link,
-.settings-disabled {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 38px;
-  padding: 9px 13px;
-  border-radius: 7px;
-  box-sizing: border-box;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.settings-link {
-  border: 1px solid #175cd3;
-  color: #fff;
-  background: #175cd3;
-  text-decoration: none;
-}
-
-.settings-link:hover {
-  background: #1849a9;
-}
-
-.settings-disabled {
-  border: 1px solid #d0d5dd;
-  color: #667085;
-  background: #f2f4f7;
-}
-
-@media (max-width: 900px) {
-  .page-header {
-    flex-wrap: wrap;
-    gap: 14px;
-  }
-
-  .page-header-main {
-    flex: 1 1 100%;
-    min-width: 100%;
-    padding-right: 0;
-  }
-
-  .page-header-actions {
-    flex: 1 1 220px;
-    min-width: 220px;
-    padding: 14px 0 0;
-    border-left: 0;
-    border-top: 2px solid #e5e7eb;
-  }
-
-  .settings-grid {
-    grid-template-columns: 1fr;
-  }
-}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="page-header">
-    <div class="page-header-main">
-      <h1>Настройки</h1>
-      <div class="small">
-        Управление параметрами рассылки, проверяющими,
-        сопоставлением логинов и почтовыми шаблонами.
-      </div>
-    </div>
-
-    <div class="page-header-actions">
-      <a class="header-button" href="/admin/">
-        Импорт участников
-      </a>
-      <a class="header-button" href="/">
-        Вернуться к отчету
-      </a>
-    </div>
-  </div>
-</div>
-
-<div class="settings-grid">
-  <section class="settings-item">
-    <h2>Общие настройки</h2>
-    <p>
-      Интервалы напоминаний, правила повторной отправки
-      и другие общие параметры работы сервиса.
-    </p>
-    <div class="item-action">
-      <a class="settings-link" href="/admin/settings/general/">Открыть настройки</a>
-    </div>
-  </section>
-
-  <section class="settings-item">
-    <h2>Проверяющие</h2>
-    <p>
-      Адресаты служебных уведомлений и параметры отправки
-      списка работников, не прошедших тестирование.
-    </p>
-    <div class="item-action">
-      <a class="settings-link" href="/admin/settings/reviewers/">Открыть проверяющих</a>
-    </div>
-  </section>
-
-  <section class="settings-item">
-    <h2>Сопоставление логинов</h2>
-    <p>
-      Ручное сопоставление e-mail работников с логинами Indigo,
-      когда логин отличается от части адреса до знака @.
-    </p>
-    <div class="item-action">
-      <a class="settings-link" href="/admin/logins/">
-        Открыть сопоставления
-      </a>
-    </div>
-  </section>
-
-  <section class="settings-item">
-    <h2>Шаблоны</h2>
-    <p>
-      Темы и тексты приглашений, напоминаний
-      и уведомлений проверяющим.
-    </p>
-    <div class="item-action">
-      <span class="settings-disabled">Будет добавлено в v2.0.3</span>
-    </div>
-  </section>
-</div>
-</body>
-</html>"""
+SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card,.item{background:#fff;border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.card{margin-bottom:18px}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;gap:10px;flex-wrap:wrap}.link{display:inline-flex;align-items:center;justify-content:center;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;font-size:13px;font-weight:600;background:#fff}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 8px;font-size:18px}.small,p{color:#667085;font-size:13px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:18px}.item{display:flex;flex-direction:column;min-height:150px;border:1px solid #e1e5ea}.item .link{margin-top:auto;align-self:flex-start;background:#175cd3;color:#fff;border-color:#175cd3}@media(max-width:800px){.grid{grid-template-columns:1fr}.header{flex-direction:column}}</style></head><body><div class="card"><div class="header"><div><h1>Настройки</h1><div class="small">Управление рассылкой, контролирующими, журналом и техническими уведомлениями.</div></div><div class="actions"><a class="link" href="/admin/">Импорт участников</a><a class="link" href="/">Отчет</a></div></div></div><div class="grid"><section class="item"><h2>Общие настройки</h2><p>Интервал и максимальное количество напоминаний, уведомление контролирующих и срок хранения журнала.</p><a class="link" href="/admin/settings/general/">Открыть</a></section><section class="item"><h2>Контролирующие</h2><p>Назначение контролирующих по тестам и получение технических ошибок.</p><a class="link" href="/admin/settings/reviewers/">Открыть</a></section><section class="item"><h2>Журнал уведомлений</h2><p>Просмотр событий рассылки, уведомлений контролирующим и технических ошибок.</p><a class="link" href="/admin/journal/">Открыть</a></section><section class="item"><h2>Технические уведомления</h2><p>Немедленные сообщения об ошибках данных и SMTP с защитой от повторов.</p><a class="link" href="/admin/settings/technical/">Открыть</a></section><section class="item"><h2>Сопоставление логинов</h2><p>Ручное сопоставление e-mail работников с логинами Indigo.</p><a class="link" href="/admin/logins/">Открыть</a></section><section class="item"><h2>Шаблоны</h2><p>Темы и тексты приглашений, напоминаний и уведомлений контролирующим.</p><span class="small">Следующий этап</span></section></div></body></html>"""
 
 
-GENERAL_SETTINGS_HTML = r"""<!doctype html>
+GENERAL_SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Общие настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;gap:10px}.link{padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none}.form{max-width:760px}.row{display:grid;grid-template-columns:1fr 200px;gap:16px;align-items:center;padding:14px 0;border-bottom:1px solid #eaecf0}label{font-weight:600}.hint,.small{color:#667085;font-size:12px}input[type=number]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}input[type=checkbox]{width:20px;height:20px}.save{margin-top:18px;padding:10px 16px;border:0;border-radius:7px;background:#175cd3;color:#fff;font-weight:600}.message{display:none;margin-top:14px;padding:12px;border-radius:7px}.success{display:block;background:#ecfdf3;color:#05603a}.error{display:block;background:#fef3f2;color:#912018}@media(max-width:720px){.header{flex-direction:column}.row{grid-template-columns:1fr}}</style></head><body><div class="card"><div class="header"><div><h1>Общие настройки</h1><div class="small">Параметры повторных напоминаний, контролирующих и журнала.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div><div class="card"><form id="form" class="form"><div class="row"><div><label>Отправлять повторные напоминания</label><div class="hint">Для работников, которым приглашение уже отправлено, но тест не завершен.</div></div><input id="enabled" type="checkbox"></div><div class="row"><div><label>Интервал между напоминаниями</label><div class="hint">Количество календарных дней.</div></div><input id="interval" type="number" min="1" max="365"></div><div class="row"><div><label>Максимальное количество напоминаний</label><div class="hint">После последнего напоминания работник получает статус «Игнорирует прохождение», а контролирующим отправляется одно письмо.</div></div><input id="max-reminders" type="number" min="1" max="100"></div><div class="row"><div><label>Уведомлять контролирующих</label><div class="hint">Письмо отправляется один раз после исчерпания всех напоминаний.</div></div><input id="notify-reviewers" type="checkbox"></div><div class="row"><div><label>Срок хранения журнала</label><div class="hint">Подробный журнал очищается автоматически. Основная история отправок сохраняется.</div></div><input id="retention" type="number" min="30" max="3650"></div><button class="save">Сохранить</button><div id="message" class="message"></div></form></div><script>async function api(u,o={}){const r=await fetch(u,o),p=await r.json();if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}function msg(t,k){const n=document.getElementById('message');n.textContent=t;n.className=`message ${k}`}async function load(){const p=await api('/api/settings/reminders');enabled.checked=p.enabled;interval.value=p.interval_days;document.getElementById('max-reminders').value=p.max_reminders;document.getElementById('notify-reviewers').checked=p.notify_reviewers;retention.value=p.journal_retention_days}form.addEventListener('submit',async e=>{e.preventDefault();try{const p=await api('/api/settings/reminders',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled.checked,interval_days:Number(interval.value),max_reminders:Number(document.getElementById('max-reminders').value),notify_reviewers:document.getElementById('notify-reviewers').checked,journal_retention_days:Number(retention.value)})});msg(`Сохранено. Максимум напоминаний: ${p.max_reminders}.`,'success')}catch(x){msg(x.message,'error')}});load().catch(x=>msg(x.message,'error'))</script></body></html>"""
+
+
+REVIEWERS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Контролирующие</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between}.link{padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}label{display:block;margin:5px 0;font-size:12px;font-weight:600}input{box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px;width:100%}.checks{display:flex;gap:14px;flex-wrap:wrap;padding:10px;border:1px solid #eaecf0;border-radius:7px}.checks label{font-weight:400}.checks input{width:auto}.button{padding:10px 14px;border:0;border-radius:7px;background:#175cd3;color:#fff;font-weight:600}.danger,.edit{padding:7px 10px;border:1px solid #98a2b3;border-radius:6px;background:#fff;cursor:pointer}.danger{color:#b42318;border-color:#f04438}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px 8px;border-bottom:1px solid #e1e5ea;text-align:left}.small{color:#667085;font-size:12px}.message{display:none;padding:12px;margin-top:12px}.success{display:block;background:#ecfdf3}.error{display:block;background:#fef3f2}@media(max-width:800px){.grid{grid-template-columns:1fr}.full{grid-column:auto}.header{flex-direction:column;gap:12px}}</style></head><body><div class="card"><div class="header"><div><h1>Контролирующие</h1><div class="small">Внутри системы сохраняется термин «проверяющие».</div></div><div><a class="link" href="/admin/settings/">Настройки</a></div></div></div><div class="card"><h2 id="title">Добавить контролирующего</h2><form id="form" class="grid"><div><label>Имя или подразделение</label><input id="name" required></div><div><label>E-mail</label><input id="email" type="email" required></div><div class="full"><label>Контролируемые тесты</label><div id="templates" class="checks"></div></div><div class="full checks"><label><input id="technical" type="checkbox"> Получает технические ошибки</label><label><input id="enabled" type="checkbox" checked> Активен</label></div><div><button class="button">Сохранить</button> <button id="cancel" type="button" class="edit" hidden>Отмена</button></div></form><div id="message" class="message"></div></div><div class="card"><h2>Список контролирующих</h2><div class="table-wrap"><table><thead><tr><th>Имя</th><th>E-mail</th><th>Тесты</th><th>Технические ошибки</th><th>Статус</th><th></th></tr></thead><tbody id="body"></tbody></table></div></div><script>let items=[],templates=[],editId=null;const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));async function api(u,o={}){const r=await fetch(u,o),p=await r.json();if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}function msg(t,k){message.textContent=t;message.className=`message ${k}`}function renderTemplates(selected=[]){document.getElementById('templates').innerHTML=templates.map(t=>`<label><input type="checkbox" data-template="${esc(t.id)}" ${selected.includes(String(t.id))?'checked':''}> ${esc(t.name)}</label>`).join('')}function selected(){return [...document.querySelectorAll('[data-template]:checked')].map(x=>x.dataset.template)}function reset(){editId=null;form.reset();enabled.checked=true;title.textContent='Добавить контролирующего';cancel.hidden=true;renderTemplates([])}function render(){body.innerHTML=items.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.email)}</td><td>${esc(x.template_ids.map(id=>(templates.find(t=>String(t.id)===String(id))||{name:id}).name).join(', ')||'–')}</td><td>${x.receives_technical_errors?'Да':'Нет'}</td><td>${x.enabled?'Активен':'Отключен'}</td><td><button class="edit" data-edit="${x.id}">Изменить</button> <button class="danger" data-del="${x.id}">Удалить</button></td></tr>`).join('');document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{const x=items.find(i=>i.id==b.dataset.edit);editId=x.id;name.value=x.name;email.value=x.email;enabled.checked=!!x.enabled;technical.checked=!!x.receives_technical_errors;renderTemplates(x.template_ids.map(String));title.textContent='Изменить контролирующего';cancel.hidden=false;scrollTo(0,0)});document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{if(confirm('Удалить контролирующего?')){await api(`/api/reviewers/${b.dataset.del}`,{method:'DELETE'});await load()}})}async function load(){const p=await api('/api/reviewers');items=p.items;templates=p.templates;renderTemplates([]);render()}form.onsubmit=async e=>{e.preventDefault();try{await api(editId?`/api/reviewers/${editId}`:'/api/reviewers',{method:editId?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.value,email:email.value,enabled:enabled.checked,receives_technical_errors:technical.checked,template_ids:selected()})});reset();await load();msg('Контролирующий сохранен.','success')}catch(x){msg(x.message,'error')}};cancel.onclick=reset;load().catch(x=>msg(x.message,'error'))</script></body></html>"""
+
+
+TECHNICAL_SETTINGS_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Общие настройки</title>
+<title>Технические уведомления</title>
 <style>
-body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 14px;font-size:18px}.header{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.actions{display:flex;gap:10px;flex-wrap:wrap}.link{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;font-size:13px;font-weight:600;background:#fff}.small{color:#667085;font-size:12px}.form{max-width:680px}.row{display:grid;grid-template-columns:1fr 180px;gap:16px;align-items:center;padding:14px 0;border-bottom:1px solid #eaecf0}.row:last-child{border-bottom:0}label{font-weight:600}.hint{margin-top:4px;color:#667085;font-size:12px;line-height:1.4}input[type=number]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}input[type=checkbox]{width:20px;height:20px}.save{margin-top:18px;padding:10px 16px;border:0;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.message{display:none;margin-top:14px;padding:12px;border-radius:7px}.message.success{display:block;background:#ecfdf3;color:#05603a}.message.error{display:block;background:#fef3f2;color:#912018}@media(max-width:720px){.header{flex-direction:column}.row{grid-template-columns:1fr}.actions{width:100%}.link{flex:1}}
+body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 14px;font-size:18px}.header{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.actions{display:flex;gap:10px;flex-wrap:wrap}.link{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;font-size:13px;font-weight:600;background:#fff}.small{color:#667085;font-size:12px}.form{max-width:760px}.row{display:grid;grid-template-columns:1fr 260px;gap:16px;align-items:center;padding:14px 0;border-bottom:1px solid #eaecf0}.row:last-child{border-bottom:0}label{font-weight:600}.hint{margin-top:4px;color:#667085;font-size:12px;line-height:1.4}input[type=email],input[type=number]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}input[type=checkbox]{width:20px;height:20px}.save{margin-top:18px;padding:10px 16px;border:0;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.message{display:none;margin-top:14px;padding:12px;border-radius:7px}.message.success{display:block;background:#ecfdf3;color:#05603a}.message.error{display:block;background:#fef3f2;color:#912018}@media(max-width:720px){.header{flex-direction:column}.row{grid-template-columns:1fr}.actions{width:100%}.link{flex:1}}
 </style></head><body>
-<div class="card"><div class="header"><div><h1>Общие настройки</h1><div class="small">Параметры повторных напоминаний и служебных уведомлений.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div>
-<div class="card"><h2>Повторные напоминания</h2><form id="form" class="form">
-<div class="row"><div><label for="enabled">Отправлять повторные напоминания</label><div class="hint">Напоминания предназначены для работников, которым приглашение уже отправлено, но тест еще не завершен.</div></div><input id="enabled" type="checkbox"></div>
-<div class="row"><div><label for="interval">Интервал между напоминаниями</label><div class="hint">Количество календарных дней после предыдущего приглашения или напоминания.</div></div><input id="interval" type="number" min="1" max="365" required></div>
-<div class="row"><div><label for="notify-reviewers">Уведомлять проверяющих</label><div class="hint">Разрешает отправку служебных уведомлений активным проверяющим.</div></div><input id="notify-reviewers" type="checkbox"></div>
+<div class="card"><div class="header"><div><h1>Технические уведомления</h1><div class="small">Ошибки данных отправляются сразу после импорта, ошибки SMTP – сразу после неудачной попытки отправки.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div>
+<div class="card"><h2>Параметры</h2><form id="form" class="form">
+<div class="row"><div><label for="enabled">Отправлять технические уведомления</label><div class="hint">При отключении ошибки продолжают записываться в базу, но письмо не отправляется.</div></div><input id="enabled" type="checkbox"></div>
+<div class="row"><div><label for="email">Технический e-mail</label><div class="hint">Адрес для немедленных сообщений об ошибках файла 1С и SMTP.</div></div><input id="email" type="email" placeholder="it@example.ru"></div>
+<div class="row"><div><label for="repeat">Повтор одинаковой ошибки</label><div class="hint">Одинаковая ошибка повторно отправляется не раньше указанного интервала. Рекомендуемое значение – 72 часа.</div></div><input id="repeat" type="number" min="1" max="8760" required></div>
 <button class="save" type="submit">Сохранить</button><div id="message" class="message"></div></form></div>
 <script>
 async function api(url,options={}){const r=await fetch(url,options);const p=await r.json();if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}function msg(t,k){const n=document.getElementById('message');n.textContent=t;n.className=`message ${k}`}
-async function load(){const p=await api('/api/settings/reminders');document.getElementById('enabled').checked=p.enabled;document.getElementById('interval').value=p.interval_days;document.getElementById('notify-reviewers').checked=p.notify_reviewers}
-document.getElementById('form').addEventListener('submit',async e=>{e.preventDefault();try{const p=await api('/api/settings/reminders',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:document.getElementById('enabled').checked,interval_days:Number(document.getElementById('interval').value),notify_reviewers:document.getElementById('notify-reviewers').checked})});msg(`Настройки сохранены. Интервал: ${p.interval_days} дн.`,'success')}catch(error){msg(error.message,'error')}});load().catch(e=>msg(e.message,'error'));
+async function load(){const p=await api('/api/settings/technical');document.getElementById('enabled').checked=p.enabled;document.getElementById('email').value=p.email;document.getElementById('repeat').value=p.repeat_hours}
+document.getElementById('form').addEventListener('submit',async e=>{e.preventDefault();try{const p=await api('/api/settings/technical',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:document.getElementById('enabled').checked,email:document.getElementById('email').value,repeat_hours:Number(document.getElementById('repeat').value)})});msg(`Настройки сохранены. Повтор одинаковой ошибки – через ${p.repeat_hours} ч.`,'success')}catch(error){msg(error.message,'error')}});load().catch(e=>msg(e.message,'error'));
 </script></body></html>"""
 
 
-REVIEWERS_HTML = r"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Проверяющие</title>
-<style>
-body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 14px;font-size:18px}.header{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.actions{display:flex;gap:10px;flex-wrap:wrap}.link{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;font-size:13px;font-weight:600;background:#fff}.small{color:#667085;font-size:12px}.grid{display:grid;grid-template-columns:minmax(240px,1fr) minmax(260px,1fr) auto auto;gap:12px;align-items:end}label{display:block;margin-bottom:5px;color:#475467;font-size:12px;font-weight:600}input{box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px;width:100%}input[type=checkbox]{width:20px;height:20px}.button{padding:10px 14px;border:0;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.danger{padding:7px 10px;border:1px solid #f04438;border-radius:6px;background:#fff;color:#b42318;cursor:pointer}.table-wrap{overflow:auto;border:1px solid #eaecf0;border-radius:8px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px 8px;border-bottom:1px solid #e1e5ea;text-align:left}th{background:#f0f2f5}.message{display:none;margin-top:12px;padding:12px;border-radius:7px}.message.success{display:block;background:#ecfdf3;color:#05603a}.message.error{display:block;background:#fef3f2;color:#912018}@media(max-width:850px){.header{flex-direction:column}.grid{grid-template-columns:1fr}.actions{width:100%}.link{flex:1}}
-</style></head><body>
-<div class="card"><div class="header"><div><h1>Проверяющие</h1><div class="small">Получатели служебных уведомлений о ходе тестирования.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div>
-<div class="card"><h2 id="form-title">Добавить проверяющего</h2><form id="form" class="grid"><div><label for="name">Имя или подразделение</label><input id="name" required placeholder="Отдел информационной безопасности"></div><div><label for="email">E-mail</label><input id="email" type="email" required placeholder="security@example.ru"></div><div><label for="enabled">Активен</label><input id="enabled" type="checkbox" checked></div><button class="button" type="submit">Сохранить</button></form><div id="message" class="message"></div></div>
-<div class="card"><h2>Список проверяющих</h2><p id="count" class="small"></p><div class="table-wrap"><table><thead><tr><th>Имя</th><th>E-mail</th><th>Статус</th><th>Изменено</th><th></th></tr></thead><tbody id="body"></tbody></table></div></div>
-<script>
-let items=[],editId=null;function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}async function api(u,o={}){const r=await fetch(u,o);const p=await r.json();if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}function msg(t,k){const n=document.getElementById('message');n.textContent=t;n.className=`message ${k}`}function fmt(v){if(!v)return'';const d=new Date(v);return Number.isNaN(d.getTime())?v:d.toLocaleString('ru-RU')}
-function render(){document.getElementById('count').textContent=`Проверяющих: ${items.length}`;document.getElementById('body').innerHTML=items.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.email)}</td><td>${x.enabled?'Активен':'Отключен'}</td><td>${esc(fmt(x.updated_at))}</td><td><button class="danger" data-id="${x.id}">Удалить</button></td></tr>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('Удалить проверяющего?'))return;try{await api(`/api/reviewers/${b.dataset.id}`,{method:'DELETE'});await load();msg('Проверяющий удален.','success')}catch(e){msg(e.message,'error')}}))}
-async function load(){const p=await api('/api/reviewers');items=p.items;render()}document.getElementById('form').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/reviewers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('name').value,email:document.getElementById('email').value,enabled:document.getElementById('enabled').checked})});e.target.reset();document.getElementById('enabled').checked=true;await load();msg('Проверяющий сохранен.','success')}catch(error){msg(error.message,'error')}});load().catch(e=>msg(e.message,'error'));
-</script></body></html>"""
+JOURNAL_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Журнал уведомлений</title><style>body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.link,button{padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;background:#fff;color:#344054;text-decoration:none;cursor:pointer}.filters{display:flex;gap:12px;margin-bottom:12px}.filters input,.filters select{padding:10px;border:1px solid #ccd2da;border-radius:6px}.filters input{flex:1}.table-wrap{overflow:auto;max-height:70vh}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #e1e5ea;text-align:left;vertical-align:top}th{position:sticky;top:0;background:#f0f2f5}.small{color:#667085;font-size:12px}@media(max-width:700px){.header{flex-direction:column}.filters{flex-direction:column}}</style></head><body><div class="card"><div class="header"><div><h1>Журнал уведомлений</h1><div class="small">Подробные события хранятся в течение срока, заданного в общих настройках.</div></div><div class="actions"><a class="link" href="/api/journal/export.xlsx">Экспорт XLSX</a><button id="cleanup">Очистить старые записи</button><a class="link" href="/admin/settings/">Настройки</a></div></div></div><div class="card"><div class="filters"><input id="search" placeholder="ФИО, e-mail, тест, получатель или подробности"><select id="status"><option value="">Все статусы</option><option value="sent">Отправлено</option><option value="error">Ошибка</option></select></div><p id="count" class="small"></p><div class="table-wrap"><table><thead><tr><th>Дата</th><th>Событие</th><th>ФИО</th><th>E-mail</th><th>Подразделение</th><th>Тест</th><th>№</th><th>Получатель</th><th>Статус</th><th>Подробности</th></tr></thead><tbody id="body"></tbody></table></div></div><script>let items=[];const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));function render(){const q=search.value.toLowerCase().trim(),st=status.value;const a=items.filter(x=>(!st||x.status===st)&&(!q||Object.values(x).join(' ').toLowerCase().includes(q)));count.textContent=`Показано записей: ${a.length}`;body.innerHTML=a.map(x=>`<tr><td>${esc(new Date(x.created_at).toLocaleString('ru-RU'))}</td><td>${esc(x.event_type)}</td><td>${esc(x.fio)}</td><td>${esc(x.email)}</td><td>${esc(x.department)}</td><td>${esc(x.template_name)}</td><td>${esc(x.reminder_number)}</td><td>${esc(x.recipient)}</td><td>${esc(x.status)}</td><td>${esc(x.details)}</td></tr>`).join('')}async function load(){const r=await fetch('/api/journal?limit=5000'),p=await r.json();items=p.items;render()}search.oninput=render;status.onchange=render;cleanup.onclick=async()=>{if(!confirm('Удалить записи старше установленного срока хранения?'))return;const r=await fetch('/api/journal/cleanup',{method:'POST'}),p=await r.json();alert(`Удалено записей: ${p.deleted}`);load()};load()</script></body></html>"""
 
 
 LOGIN_OVERRIDES_HTML = r"""<!doctype html>

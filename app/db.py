@@ -162,9 +162,41 @@ CREATE TABLE IF NOT EXISTS reviewers (
     name TEXT NOT NULL,
     email TEXT NOT NULL UNIQUE COLLATE NOCASE,
     enabled INTEGER NOT NULL DEFAULT 1,
+    receives_technical_errors INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS reviewer_templates (
+    reviewer_id INTEGER NOT NULL,
+    template_id TEXT NOT NULL,
+    PRIMARY KEY(reviewer_id, template_id),
+    FOREIGN KEY(reviewer_id) REFERENCES reviewers(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS notification_journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    worker_key TEXT,
+    employment_seq INTEGER,
+    fio TEXT,
+    email TEXT,
+    department TEXT,
+    position TEXT,
+    template_id TEXT,
+    template_name TEXT,
+    reminder_number INTEGER,
+    recipient TEXT,
+    status TEXT NOT NULL,
+    details TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_journal_created
+ON notification_journal(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_notification_journal_lookup
+ON notification_journal(template_id, worker_key, employment_seq, event_type);
 
 CREATE TABLE IF NOT EXISTS technical_errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,6 +259,12 @@ class Database:
         }
 
     def _migrate(self, connection: sqlite3.Connection) -> None:
+        reviewer_columns = self._column_names(connection, "reviewers")
+        if "receives_technical_errors" not in reviewer_columns:
+            connection.execute(
+                "ALTER TABLE reviewers ADD COLUMN receives_technical_errors INTEGER NOT NULL DEFAULT 0"
+            )
+
         employee_columns = self._column_names(connection, "employees")
         if "employment_started_at" not in employee_columns:
             connection.execute("ALTER TABLE employees ADD COLUMN employment_started_at TEXT")
