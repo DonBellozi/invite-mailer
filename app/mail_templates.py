@@ -38,12 +38,30 @@ def ensure_mail_templates(db: Database, templates: list[dict]) -> None:
         ("reviewer", "*", "Работник игнорирует прохождение теста «{{ test_name }}»",
          "<p>Работник не завершил обязательное тестирование после всех предусмотренных напоминаний.</p><p>ФИО: {{ fio }}<br>E-mail: {{ email }}<br>Подразделение: {{ department }}<br>Должность: {{ position }}<br>Тест: {{ test_name }}<br>Количество напоминаний: {{ reminder_count }}<br>Первое напоминание: {{ first_reminder_at }}<br>Последнее напоминание: {{ last_reminder_at }}</p>", 1),
         ("technical", "*", "{{ subject }}",
-         "<p>ФИО: {{ fio }}</p><p>E-mail: {{ email }}</p><p>Тип ошибки: {{ error_type }}</p>{% if error_text %}<pre style='white-space:pre-wrap'>{{ error_text }}</pre>{% endif %}<p>Дата обнаружения: {{ detected_at }}</p>", 1),
+         "<p>При выполнении рассылки обнаружено ошибок: <strong>{{ errors_count }}</strong>.</p>"
+         "{% for error in errors %}"
+         "<div style='margin:0 0 16px 0;padding:12px;border:1px solid #d9d9d9;border-radius:6px'>"
+         "<p style='margin:0 0 6px 0'><strong>ФИО:</strong> {{ error.fio }}</p>"
+         "<p style='margin:0 0 6px 0'><strong>E-mail:</strong> {{ error.email }}</p>"
+         "<p style='margin:0 0 6px 0'><strong>Тип ошибки:</strong> {{ error.error_type }}</p>"
+         "{% if error.error_text %}<p style='margin:0 0 6px 0'><strong>Текст ошибки:</strong></p>"
+         "<pre style='white-space:pre-wrap;margin:0 0 6px 0'>{{ error.error_text }}</pre>{% endif %}"
+         "<p style='margin:0'><strong>Дата обнаружения:</strong> {{ error.detected_at }}</p>"
+         "</div>{% endfor %}", 1),
     ])
     with db.connect() as c:
         for kind, tid, subject, body, enabled in defaults:
             c.execute("""INSERT OR IGNORE INTO mail_templates(kind, template_id, subject, body_html, enabled, updated_at)
                          VALUES (?, ?, ?, ?, ?, ?)""", (kind, tid, subject, body, enabled, _now()))
+        # Однократное безопасное обновление прежнего стандартного технического шаблона.
+        # Пользовательские шаблоны не изменяются.
+        old_technical_body = "<p>ФИО: {{ fio }}</p><p>E-mail: {{ email }}</p><p>Тип ошибки: {{ error_type }}</p>{% if error_text %}<pre style='white-space:pre-wrap'>{{ error_text }}</pre>{% endif %}<p>Дата обнаружения: {{ detected_at }}</p>"
+        new_technical_body = next(body for kind, tid, _subject, body, _enabled in defaults if kind == "technical" and tid == "*")
+        c.execute(
+            """UPDATE mail_templates SET body_html = ?, updated_at = ?
+               WHERE kind = 'technical' AND template_id = '*' AND body_html = ?""",
+            (new_technical_body, _now(), old_technical_body),
+        )
 
 
 def get_mail_template(db: Database, kind: str, template_id: str = "*") -> dict:

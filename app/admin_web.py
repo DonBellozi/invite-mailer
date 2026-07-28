@@ -3,8 +3,7 @@ from __future__ import annotations
 import io
 import os
 import secrets
-from datetime import timedelta
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
@@ -776,6 +775,136 @@ def save_mail_template(kind: str, template_id: str, request: MailTemplateRequest
     return {"status": "ok"}
 
 
+def _display_timestamp(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "Не указано"
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone().strftime("%d.%m.%Y %H:%M:%S")
+    except (TypeError, ValueError):
+        return text
+
+
+def _technical_test_context(db: Database, limit: int = 20) -> tuple[dict, str, int]:
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT fio, email, error_type, error_text, detected_at
+            FROM technical_errors
+            ORDER BY CASE WHEN notified_at IS NULL THEN 0 ELSE 1 END, detected_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    errors = [
+        {
+            "fio": str(row["fio"] or "Не указано"),
+            "email": str(row["email"] or "Не указан"),
+            "error_type": str(row["error_type"] or "Не указано"),
+            "error_text": str(row["error_text"] or ""),
+            "detected_at": _display_timestamp(row["detected_at"]),
+        }
+        for row in reversed(rows)
+    ]
+    source = "real"
+    if not errors:
+        now = datetime.now().astimezone().strftime("%d.%m.%Y %H:%M:%S")
+        errors = [
+            {
+                "fio": "Иванов Иван Иванович",
+                "email": "ivanov.ii@example.ru",
+                "error_type": "Ошибка отправки письма",
+                "error_text": "SMTP server temporarily unavailable",
+                "detected_at": now,
+            },
+            {
+                "fio": "Петров Петр Петрович",
+                "email": "petrov.pp@example.ru",
+                "error_type": "Некорректный адрес электронной почты",
+                "error_text": "Mailbox does not exist",
+                "detected_at": now,
+            },
+        ]
+        source = "demo"
+
+    first = errors[0]
+    return {
+        "subject": "Ошибки отправки писем",
+        "fio": first["fio"],
+        "email": first["email"],
+        "error_type": first["error_type"],
+        "error_text": first["error_text"],
+        "detected_at": first["detected_at"],
+        "errors": errors,
+        "errors_count": len(errors),
+        "displayed_errors_count": len(errors),
+    }, source, len(errors)
+
+
+def _reviewer_test_context(db: Database) -> tuple[dict, str, int]:
+    templates = {str(item["id"]): item for item in load_test_definitions(settings(), db)}
+    with db.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM reviewer_notification_queue
+            ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END, created_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row:
+            template = templates.get(str(row["template_id"]), {})
+            return {
+                "fio": str(row["fio"] or "Не указано"),
+                "email": str(row["email"] or "Не указан"),
+                "department": str(row["department"] or "Не указано"),
+                "position": str(row["position"] or "Не указана"),
+                "test_name": str(template.get("name") or row["template_id"] or "Тест"),
+                "reminder_count": int(row["reminder_count"] or 0),
+                "first_reminder_at": _display_timestamp(row["first_reminder_at"]),
+                "last_reminder_at": _display_timestamp(row["last_reminder_at"]),
+                "reviewer_name": "Контролирующий",
+            }, "real_queue", 1
+
+        employee = connection.execute(
+            """
+            SELECT * FROM employees
+            ORDER BY active DESC, updated_at DESC, fio COLLATE NOCASE
+            LIMIT 1
+            """
+        ).fetchone()
+
+    if employee:
+        template = next(iter(templates.values()), {})
+        now = datetime.now().astimezone()
+        return {
+            "fio": str(employee["fio"] or "Не указано"),
+            "email": str(employee["email"] or "Не указан"),
+            "department": str(employee["department"] or "Не указано"),
+            "position": str(employee["position"] or "Не указана"),
+            "test_name": str(template.get("name") or "Тест"),
+            "reminder_count": 3,
+            "first_reminder_at": (now - timedelta(days=14)).strftime("%d.%m.%Y %H:%M:%S"),
+            "last_reminder_at": now.strftime("%d.%m.%Y %H:%M:%S"),
+            "reviewer_name": "Контролирующий",
+        }, "real_employee", 1
+
+    return {
+        "fio": "Иванов Иван Иванович",
+        "email": "ivanov.ii@example.ru",
+        "department": "Тестовое подразделение",
+        "position": "Тестовая должность",
+        "test_name": "Тестовое тестирование",
+        "reminder_count": 3,
+        "first_reminder_at": "01.07.2026 09:00:00",
+        "last_reminder_at": "15.07.2026 09:00:00",
+        "reviewer_name": "Контролирующий",
+    }, "demo", 1
+
+
 @app.post("/api/settings/templates/test-email")
 def send_test_template(request: TestEmailRequest, _: Annotated[str, Depends(require_admin)]):
     recipient = request.recipient.strip()
@@ -783,16 +912,28 @@ def send_test_template(request: TestEmailRequest, _: Annotated[str, Depends(requ
         raise HTTPException(status_code=400, detail="Укажите корректный e-mail получателя")
     if request.kind not in {"invitation", "reminder", "reviewer", "technical"}:
         raise HTTPException(status_code=400, detail="Неизвестный тип шаблона")
+
+    db = database()
+    template_name = next(
+        (str(t.get("name")) for t in load_test_definitions(settings(), db) if str(t.get("id")) == request.template_id),
+        "Тест",
+    )
     context = {
         "fio": "Иванов Иван Иванович", "email": recipient, "login": "ivanov.ii",
         "department": "Тестовое подразделение", "position": "Тестовая должность",
-        "test_name": next((str(t.get("name")) for t in load_test_definitions(settings(), database()) if str(t.get("id")) == request.template_id), "Тест"),
-        "reminder_number": 1, "reminder_count": 3,
+        "test_name": template_name, "reminder_number": 1, "reminder_count": 3,
         "first_reminder_at": "01.07.2026 09:00", "last_reminder_at": "15.07.2026 09:00",
-        "subject": "Тестовое техническое уведомление", "error_type": "тестовая ошибка",
+        "subject": "Тестовое техническое уведомление", "error_type": "Тестовая ошибка",
         "error_text": "Проверка отображения шаблона", "detected_at": _utc_now(),
         "reviewer_name": "Контролирующий",
     }
+    data_source = "demo"
+    data_count = 1
+    if request.kind == "technical":
+        context, data_source, data_count = _technical_test_context(db)
+    elif request.kind == "reviewer":
+        context, data_source, data_count = _reviewer_test_context(db)
+
     from jinja2 import Environment, StrictUndefined
     try:
         env = Environment(undefined=StrictUndefined, autoescape=True)
@@ -801,7 +942,7 @@ def send_test_template(request: TestEmailRequest, _: Annotated[str, Depends(requ
         send_html_email(settings().smtp, recipient, subject, body)
     except Exception as error:
         raise HTTPException(status_code=400, detail=f"Не удалось отправить тестовое письмо: {error}") from error
-    return {"status": "ok"}
+    return {"status": "ok", "data_source": data_source, "data_count": data_count}
 
 
 @app.get("/api/settings/indigo-tests")
@@ -927,7 +1068,7 @@ GENERAL_SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="
 TEMPLATES_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Системные шаблоны</title><style>
 body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;min-width:190px}.link,.button{display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:10px 14px;border:1px solid #98a2b3;border-radius:7px;background:#fff;color:#344054;text-decoration:none;font-weight:600;cursor:pointer}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.full{grid-column:1/-1}label{display:block;font-size:12px;font-weight:600;margin:5px 0}input,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}textarea{min-height:240px;font-family:Consolas,monospace}.small{font-size:12px;color:#667085}.message{display:none;padding:12px}.success{display:block;background:#ecfdf3}.error{display:block;background:#fef3f2}@media(max-width:800px){.grid{grid-template-columns:1fr}.full{grid-column:auto}.header{flex-direction:column}}
 </style></head><body><div class="card"><div class="header"><div><h1>Системные шаблоны</h1><div class="small">Общие письма контролирующему и технические уведомления.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div><div id="forms"></div><div id="message" class="message"></div><script>
-let items=[];const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));async function api(u,o={}){const r=await fetch(u,o);let p={};try{p=await r.json()}catch(_){p={}}if(!r.ok)throw new Error(typeof p.detail==='string'?p.detail:`HTTP ${r.status}`);return p}function msg(t,k){message.textContent=t;message.className=`message ${k}`}function title(k){return k==='reviewer'?'Уведомление контролирующему':'Техническое уведомление'}function render(){forms.innerHTML=items.filter(x=>['reviewer','technical'].includes(x.kind)).map((x,i)=>`<section class="card" data-key="${x.kind}"><h2>${title(x.kind)}</h2><div class="grid"><label><input type="checkbox" data-f="enabled" ${x.enabled?'checked':''}> Использовать шаблон</label><div></div><div class="full"><label>Тема</label><input data-f="subject" value="${esc(x.subject)}"></div><div class="full"><label>HTML-текст</label><textarea data-f="body_html">${esc(x.body_html)}</textarea></div><div><label>Тестовый e-mail</label><input type="email" data-f="recipient" placeholder="user@example.ru"></div><div style="display:flex;gap:10px;align-items:end"><button class="button" data-test>Отправить тестовое</button><button class="button primary" data-save>Сохранить</button></div></div></section>`).join('');document.querySelectorAll('[data-save]').forEach(b=>b.onclick=()=>save(b.closest('section')));document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>test(b.closest('section')))}function val(sec,f){const e=sec.querySelector(`[data-f="${f}"]`);return f==='enabled'?e.checked:e.value}async function save(sec){const k=sec.dataset.key;await api(`/api/settings/templates/${k}/*`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({subject:val(sec,'subject'),body_html:val(sec,'body_html'),enabled:val(sec,'enabled')})});msg('Шаблон сохранен.','success')}async function test(sec){const k=sec.dataset.key;await api('/api/settings/templates/test-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient:val(sec,'recipient'),kind:k,template_id:'*',subject:val(sec,'subject'),body_html:val(sec,'body_html')})});msg('Тестовое письмо отправлено.','success')}async function load(){items=(await api('/api/settings/templates')).items;render()}load().catch(e=>msg(e.message,'error'));
+let items=[];const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));async function api(u,o={}){const r=await fetch(u,o);let p={};try{p=await r.json()}catch(_){p={}}if(!r.ok)throw new Error(typeof p.detail==='string'?p.detail:`HTTP ${r.status}`);return p}function msg(t,k){message.textContent=t;message.className=`message ${k}`}function title(k){return k==='reviewer'?'Уведомление контролирующему':'Техническое уведомление'}function render(){forms.innerHTML=items.filter(x=>['reviewer','technical'].includes(x.kind)).map((x,i)=>`<section class="card" data-key="${x.kind}"><h2>${title(x.kind)}</h2><div class="grid"><label><input type="checkbox" data-f="enabled" ${x.enabled?'checked':''}> Использовать шаблон</label><div></div><div class="full"><label>Тема</label><input data-f="subject" value="${esc(x.subject)}"></div><div class="full"><label>HTML-текст</label><textarea data-f="body_html">${esc(x.body_html)}</textarea></div><div><label>Тестовый e-mail</label><input type="email" data-f="recipient" placeholder="user@example.ru"></div><div style="display:flex;gap:10px;align-items:end"><button class="button" data-test>Отправить тестовое</button><button class="button primary" data-save>Сохранить</button></div></div></section>`).join('');document.querySelectorAll('[data-save]').forEach(b=>b.onclick=()=>save(b.closest('section')));document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>test(b.closest('section')))}function val(sec,f){const e=sec.querySelector(`[data-f="${f}"]`);return f==='enabled'?e.checked:e.value}async function save(sec){const k=sec.dataset.key;await api(`/api/settings/templates/${k}/*`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({subject:val(sec,'subject'),body_html:val(sec,'body_html'),enabled:val(sec,'enabled')})});msg('Шаблон сохранен.','success')}async function test(sec){try{const k=sec.dataset.key;const r=await api('/api/settings/templates/test-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient:val(sec,'recipient'),kind:k,template_id:'*',subject:val(sec,'subject'),body_html:val(sec,'body_html')})});const source=r.data_source==='demo'?'использованы демонстрационные данные':r.data_source==='real_employee'?'использованы данные реального работника':'использованы реальные данные из базы';msg(`Тестовое письмо отправлено – ${source}${r.data_count?` (${r.data_count})`:''}.`,'success')}catch(e){msg(e.message,'error')}}async function load(){items=(await api('/api/settings/templates')).items;render()}load().catch(e=>msg(e.message,'error'));
 </script></body></html>"""
 
 TESTS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Тесты и письма</title><style>
