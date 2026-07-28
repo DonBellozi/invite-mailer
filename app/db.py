@@ -150,6 +150,37 @@ CREATE TABLE IF NOT EXISTS login_overrides (
 CREATE INDEX IF NOT EXISTS idx_login_overrides_login
 ON login_overrides(login);
 
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reviewers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS technical_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL,
+    fio TEXT,
+    email TEXT,
+    error_type TEXT NOT NULL,
+    error_text TEXT,
+    detected_at TEXT NOT NULL,
+    notified_at TEXT,
+    notification_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_technical_errors_fingerprint
+ON technical_errors(fingerprint, detected_at);
+
 CREATE TABLE IF NOT EXISTS indigo_attempts (
     result_id INTEGER PRIMARY KEY,
     login TEXT NOT NULL,

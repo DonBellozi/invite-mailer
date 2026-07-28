@@ -17,6 +17,7 @@ from .indigo import summarize_employee_result, try_sync_indigo_results
 from .mailer import send_html_email
 from .report import build_report
 from .settings import Settings
+from .technical_alerts import notify_technical_error
 from .xlsx_parser import EmployeeRecord, parse_xlsx
 
 
@@ -206,6 +207,30 @@ def _parse_employee_file(settings: Settings, db: Database, path: Path) -> list[E
     )
 
 
+def _report_invalid_domains(settings: Settings, db: Database, records: list[EmployeeRecord]) -> None:
+    mail_config = settings.config.get("mail", {})
+    if not bool(mail_config.get("validate_domain", True)):
+        return
+    allowed_domains = {str(domain).strip().lower() for domain in mail_config.get("allowed_domains", []) if str(domain).strip()}
+    if not allowed_domains:
+        return
+    for record in records:
+        address = (record.email or "").strip()
+        if not address or "@" not in address:
+            continue
+        domain = address.rsplit("@", 1)[-1].lower()
+        if domain in allowed_domains:
+            continue
+        notify_technical_error(
+            settings,
+            db,
+            subject="При обработке данных обнаружена ошибка",
+            fio=record.fio,
+            email_address=address,
+            error_type="адрес электронной почты не принадлежит домену организации",
+        )
+
+
 def fetch_and_import(settings: Settings, db: Database) -> Path:
     source = settings.config["source"]
     archive_dir = settings.data_path / "archive"
@@ -228,10 +253,12 @@ def fetch_and_import(settings: Settings, db: Database) -> Path:
             shutil.copy2(result.saved_path, current_file)
         # Даже для уже обработанного XLSX заново применяем LOGIN_OVERRIDES_JSON.
         records = _parse_employee_file(settings, db, current_file)
+        _report_invalid_domains(settings, db, records)
         import_employees(db, records, int(source.get("absence_grace_imports", 1)))
         return current_file
 
     records = _parse_employee_file(settings, db, result.saved_path)
+    _report_invalid_domains(settings, db, records)
 
     min_employees = int(source.get("min_employees", 1))
     if len(records) < min_employees:
@@ -331,6 +358,7 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
                 if validate_domain and allowed_domains and domain not in allowed_domains:
                     summary["errors"] += 1
                     if not dry_run:
+                        error_message = f"Недопустимый почтовый домен: {domain}"
                         connection.execute(
                             """
                             INSERT INTO notification_history(
@@ -338,14 +366,15 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
                                 sent_at, status, method, error_text
                             ) VALUES (?, ?, ?, ?, ?, 'error', 'automatic', ?)
                             """,
-                            (
-                                employee["worker_key"],
-                                employee["employment_seq"],
-                                template["id"],
-                                email_address,
-                                now_iso(),
-                                f"Недопустимый почтовый домен: {domain}",
-                            ),
+                            (employee["worker_key"], employee["employment_seq"], template["id"], email_address, now_iso(), error_message),
+                        )
+                        connection.commit()
+                        notify_technical_error(
+                            settings, db,
+                            subject="При обработке данных обнаружена ошибка",
+                            fio=employee["fio"],
+                            email_address=email_address,
+                            error_type="адрес электронной почты не принадлежит домену организации",
                         )
                     continue
 
@@ -403,6 +432,15 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
                         ),
                     )
                     summary["errors"] += 1
+                    connection.commit()
+                    notify_technical_error(
+                        settings, db,
+                        subject="При отправке сообщения обнаружена ошибка",
+                        fio=employee["fio"],
+                        email_address=email_address,
+                        error_type="ошибка отправки SMTP",
+                        error_text=str(error),
+                    )
 
     return summary
 
