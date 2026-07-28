@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import secrets
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
@@ -58,12 +59,82 @@ def settings() -> Settings:
     return _settings
 
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _ensure_v202_schema(db: Database) -> None:
+    with db.connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reviewers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        defaults = {
+            "reminders_enabled": "1",
+            "reminder_interval_days": "7",
+            "reviewer_notifications_enabled": "1",
+        }
+        now = _utc_now()
+        for key, value in defaults.items():
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (key, value, now),
+            )
+        connection.commit()
+
+
 def database() -> Database:
     global _db
     if _db is None:
         _db = Database(settings().database_path)
         bootstrap_legacy_overrides(settings(), _db)
+        _ensure_v202_schema(_db)
     return _db
+
+
+def _read_setting(key: str, default: str) -> str:
+    with database().connect() as connection:
+        row = connection.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+    return str(row["value"]) if row else default
+
+
+def _write_setting(key: str, value: str) -> None:
+    now = _utc_now()
+    with database().connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, now),
+        )
+        connection.commit()
 
 
 def require_admin(
@@ -105,6 +176,18 @@ class LoginOverrideRequest(BaseModel):
     login: str
 
 
+class ReminderSettingsRequest(BaseModel):
+    enabled: bool
+    interval_days: int
+    notify_reviewers: bool
+
+
+class ReviewerRequest(BaseModel):
+    name: str
+    email: str
+    enabled: bool = True
+
+
 def find_report_template(
     template_id: str,
 ) -> dict:
@@ -136,9 +219,161 @@ def settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return SETTINGS_HTML
 
 
+@app.get("/admin/settings/general/", response_class=HTMLResponse)
+def general_settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
+    return GENERAL_SETTINGS_HTML
+
+
+@app.get("/admin/settings/reviewers/", response_class=HTMLResponse)
+def reviewers_page(_: Annotated[str, Depends(require_admin)]) -> str:
+    return REVIEWERS_HTML
+
+
 @app.get("/admin/logins/", response_class=HTMLResponse)
 def login_overrides_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return LOGIN_OVERRIDES_HTML
+
+
+@app.get("/api/settings/reminders")
+def read_reminder_settings(_: Annotated[str, Depends(require_admin)]):
+    return {
+        "enabled": _read_setting("reminders_enabled", "1") == "1",
+        "interval_days": int(_read_setting("reminder_interval_days", "7")),
+        "notify_reviewers": _read_setting(
+            "reviewer_notifications_enabled", "1"
+        ) == "1",
+    }
+
+
+@app.put("/api/settings/reminders")
+def write_reminder_settings(
+    request: ReminderSettingsRequest,
+    _: Annotated[str, Depends(require_admin)],
+):
+    if request.interval_days < 1 or request.interval_days > 365:
+        raise HTTPException(
+            status_code=400,
+            detail="Интервал должен быть от 1 до 365 дней",
+        )
+    _write_setting("reminders_enabled", "1" if request.enabled else "0")
+    _write_setting("reminder_interval_days", str(request.interval_days))
+    _write_setting(
+        "reviewer_notifications_enabled",
+        "1" if request.notify_reviewers else "0",
+    )
+    return read_reminder_settings(_)
+
+
+@app.get("/api/reviewers")
+def read_reviewers(_: Annotated[str, Depends(require_admin)]):
+    with database().connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, name, email, enabled, created_at, updated_at
+            FROM reviewers
+            ORDER BY enabled DESC, name COLLATE NOCASE, email COLLATE NOCASE
+            """
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}
+
+
+@app.post("/api/reviewers")
+def create_reviewer(
+    request: ReviewerRequest,
+    _: Annotated[str, Depends(require_admin)],
+):
+    name = request.name.strip()
+    email = request.email.strip().lower()
+    if not name:
+        raise HTTPException(status_code=400, detail="Укажите имя проверяющего")
+    if "@" not in email or email.startswith("@") or email.endswith("@"):
+        raise HTTPException(status_code=400, detail="Некорректный e-mail")
+    now = _utc_now()
+    try:
+        with database().connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO reviewers (
+                    name, email, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (name, email, int(request.enabled), now, now),
+            )
+            connection.commit()
+            reviewer_id = cursor.lastrowid
+            row = connection.execute(
+                """
+                SELECT id, name, email, enabled, created_at, updated_at
+                FROM reviewers WHERE id = ?
+                """,
+                (reviewer_id,),
+            ).fetchone()
+    except Exception as error:
+        if "UNIQUE" in str(error).upper():
+            raise HTTPException(
+                status_code=400,
+                detail="Проверяющий с таким e-mail уже добавлен",
+            ) from error
+        raise
+    return dict(row)
+
+
+@app.put("/api/reviewers/{reviewer_id}")
+def update_reviewer(
+    reviewer_id: int,
+    request: ReviewerRequest,
+    _: Annotated[str, Depends(require_admin)],
+):
+    name = request.name.strip()
+    email = request.email.strip().lower()
+    if not name:
+        raise HTTPException(status_code=400, detail="Укажите имя проверяющего")
+    if "@" not in email or email.startswith("@") or email.endswith("@"):
+        raise HTTPException(status_code=400, detail="Некорректный e-mail")
+    try:
+        with database().connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE reviewers
+                SET name = ?, email = ?, enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (name, email, int(request.enabled), _utc_now(), reviewer_id),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Проверяющий не найден")
+            connection.commit()
+            row = connection.execute(
+                """
+                SELECT id, name, email, enabled, created_at, updated_at
+                FROM reviewers WHERE id = ?
+                """,
+                (reviewer_id,),
+            ).fetchone()
+    except HTTPException:
+        raise
+    except Exception as error:
+        if "UNIQUE" in str(error).upper():
+            raise HTTPException(
+                status_code=400,
+                detail="Проверяющий с таким e-mail уже добавлен",
+            ) from error
+        raise
+    return dict(row)
+
+
+@app.delete("/api/reviewers/{reviewer_id}")
+def delete_reviewer(
+    reviewer_id: int,
+    _: Annotated[str, Depends(require_admin)],
+):
+    with database().connect() as connection:
+        cursor = connection.execute(
+            "DELETE FROM reviewers WHERE id = ?",
+            (reviewer_id,),
+        )
+        connection.commit()
+    return {"deleted": cursor.rowcount > 0}
 
 
 @app.get("/api/login-overrides")
@@ -512,7 +747,7 @@ h1 {
       и другие общие параметры работы сервиса.
     </p>
     <div class="item-action">
-      <span class="settings-disabled">Будет добавлено в v2.0.2</span>
+      <a class="settings-link" href="/admin/settings/general/">Открыть настройки</a>
     </div>
   </section>
 
@@ -523,7 +758,7 @@ h1 {
       списка работников, не прошедших тестирование.
     </p>
     <div class="item-action">
-      <span class="settings-disabled">Будет добавлено в v2.0.2</span>
+      <a class="settings-link" href="/admin/settings/reviewers/">Открыть проверяющих</a>
     </div>
   </section>
 
@@ -553,6 +788,40 @@ h1 {
 </div>
 </body>
 </html>"""
+
+
+GENERAL_SETTINGS_HTML = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Общие настройки</title>
+<style>
+body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 14px;font-size:18px}.header{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.actions{display:flex;gap:10px;flex-wrap:wrap}.link{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;font-size:13px;font-weight:600;background:#fff}.small{color:#667085;font-size:12px}.form{max-width:680px}.row{display:grid;grid-template-columns:1fr 180px;gap:16px;align-items:center;padding:14px 0;border-bottom:1px solid #eaecf0}.row:last-child{border-bottom:0}label{font-weight:600}.hint{margin-top:4px;color:#667085;font-size:12px;line-height:1.4}input[type=number]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}input[type=checkbox]{width:20px;height:20px}.save{margin-top:18px;padding:10px 16px;border:0;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.message{display:none;margin-top:14px;padding:12px;border-radius:7px}.message.success{display:block;background:#ecfdf3;color:#05603a}.message.error{display:block;background:#fef3f2;color:#912018}@media(max-width:720px){.header{flex-direction:column}.row{grid-template-columns:1fr}.actions{width:100%}.link{flex:1}}
+</style></head><body>
+<div class="card"><div class="header"><div><h1>Общие настройки</h1><div class="small">Параметры повторных напоминаний и служебных уведомлений.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div>
+<div class="card"><h2>Повторные напоминания</h2><form id="form" class="form">
+<div class="row"><div><label for="enabled">Отправлять повторные напоминания</label><div class="hint">Напоминания предназначены для работников, которым приглашение уже отправлено, но тест еще не завершен.</div></div><input id="enabled" type="checkbox"></div>
+<div class="row"><div><label for="interval">Интервал между напоминаниями</label><div class="hint">Количество календарных дней после предыдущего приглашения или напоминания.</div></div><input id="interval" type="number" min="1" max="365" required></div>
+<div class="row"><div><label for="notify-reviewers">Уведомлять проверяющих</label><div class="hint">Разрешает отправку служебных уведомлений активным проверяющим.</div></div><input id="notify-reviewers" type="checkbox"></div>
+<button class="save" type="submit">Сохранить</button><div id="message" class="message"></div></form></div>
+<script>
+async function api(url,options={}){const r=await fetch(url,options);const p=await r.json();if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}function msg(t,k){const n=document.getElementById('message');n.textContent=t;n.className=`message ${k}`}
+async function load(){const p=await api('/api/settings/reminders');document.getElementById('enabled').checked=p.enabled;document.getElementById('interval').value=p.interval_days;document.getElementById('notify-reviewers').checked=p.notify_reviewers}
+document.getElementById('form').addEventListener('submit',async e=>{e.preventDefault();try{const p=await api('/api/settings/reminders',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:document.getElementById('enabled').checked,interval_days:Number(document.getElementById('interval').value),notify_reviewers:document.getElementById('notify-reviewers').checked})});msg(`Настройки сохранены. Интервал: ${p.interval_days} дн.`,'success')}catch(error){msg(error.message,'error')}});load().catch(e=>msg(e.message,'error'));
+</script></body></html>"""
+
+
+REVIEWERS_HTML = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Проверяющие</title>
+<style>
+body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 14px;font-size:18px}.header{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.actions{display:flex;gap:10px;flex-wrap:wrap}.link{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;font-size:13px;font-weight:600;background:#fff}.small{color:#667085;font-size:12px}.grid{display:grid;grid-template-columns:minmax(240px,1fr) minmax(260px,1fr) auto auto;gap:12px;align-items:end}label{display:block;margin-bottom:5px;color:#475467;font-size:12px;font-weight:600}input{box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px;width:100%}input[type=checkbox]{width:20px;height:20px}.button{padding:10px 14px;border:0;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.danger{padding:7px 10px;border:1px solid #f04438;border-radius:6px;background:#fff;color:#b42318;cursor:pointer}.table-wrap{overflow:auto;border:1px solid #eaecf0;border-radius:8px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px 8px;border-bottom:1px solid #e1e5ea;text-align:left}th{background:#f0f2f5}.message{display:none;margin-top:12px;padding:12px;border-radius:7px}.message.success{display:block;background:#ecfdf3;color:#05603a}.message.error{display:block;background:#fef3f2;color:#912018}@media(max-width:850px){.header{flex-direction:column}.grid{grid-template-columns:1fr}.actions{width:100%}.link{flex:1}}
+</style></head><body>
+<div class="card"><div class="header"><div><h1>Проверяющие</h1><div class="small">Получатели служебных уведомлений о ходе тестирования.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div>
+<div class="card"><h2 id="form-title">Добавить проверяющего</h2><form id="form" class="grid"><div><label for="name">Имя или подразделение</label><input id="name" required placeholder="Отдел информационной безопасности"></div><div><label for="email">E-mail</label><input id="email" type="email" required placeholder="security@example.ru"></div><div><label for="enabled">Активен</label><input id="enabled" type="checkbox" checked></div><button class="button" type="submit">Сохранить</button></form><div id="message" class="message"></div></div>
+<div class="card"><h2>Список проверяющих</h2><p id="count" class="small"></p><div class="table-wrap"><table><thead><tr><th>Имя</th><th>E-mail</th><th>Статус</th><th>Изменено</th><th></th></tr></thead><tbody id="body"></tbody></table></div></div>
+<script>
+let items=[],editId=null;function esc(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}async function api(u,o={}){const r=await fetch(u,o);const p=await r.json();if(!r.ok)throw new Error(p.detail||`HTTP ${r.status}`);return p}function msg(t,k){const n=document.getElementById('message');n.textContent=t;n.className=`message ${k}`}function fmt(v){if(!v)return'';const d=new Date(v);return Number.isNaN(d.getTime())?v:d.toLocaleString('ru-RU')}
+function render(){document.getElementById('count').textContent=`Проверяющих: ${items.length}`;document.getElementById('body').innerHTML=items.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.email)}</td><td>${x.enabled?'Активен':'Отключен'}</td><td>${esc(fmt(x.updated_at))}</td><td><button class="danger" data-id="${x.id}">Удалить</button></td></tr>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('Удалить проверяющего?'))return;try{await api(`/api/reviewers/${b.dataset.id}`,{method:'DELETE'});await load();msg('Проверяющий удален.','success')}catch(e){msg(e.message,'error')}}))}
+async function load(){const p=await api('/api/reviewers');items=p.items;render()}document.getElementById('form').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/reviewers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('name').value,email:document.getElementById('email').value,enabled:document.getElementById('enabled').checked})});e.target.reset();document.getElementById('enabled').checked=true;await load();msg('Проверяющий сохранен.','success')}catch(error){msg(error.message,'error')}});load().catch(e=>msg(e.message,'error'));
+</script></body></html>"""
 
 
 LOGIN_OVERRIDES_HTML = r"""<!doctype html>
