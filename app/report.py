@@ -668,7 +668,11 @@ def build_report(
 
             participant_counts[
                 str(template["id"])
-            ] = len(employees)
+            ] = sum(
+                1
+                for employee in employees
+                if employee["email"]
+            )
 
             for employee in employees:
                 latest = connection.execute(
@@ -754,10 +758,13 @@ def build_report(
                     quote=True,
                 )
 
+                has_email = "1" if employee["email"] else "0"
+
                 rows.append(
                     f"<tr "
                     f"data-template-id='{template_id}' "
                     f"data-template-name='{template_name}' "
+                    f"data-has-email='{has_email}' "
                     f"data-status='{escaped_status_key}'>"
                     f"{cells}"
                     f"<td class='{status_class}'>"
@@ -1088,13 +1095,13 @@ function updateTestDashboard() {{
     row => row.dataset.status === 'failed'
   ).length;
 
-  const withoutEmail = testRows.filter(
-    row => row.dataset.status === 'no_email'
-  ).length;
+  const participantRows = testRows.filter(
+    row => row.dataset.hasEmail === '1'
+  );
 
   const waiting = Math.max(
     0,
-    testRows.length - completed - failed - withoutEmail
+    participantRows.length - completed - failed
   );
 
   document.getElementById(
@@ -1107,7 +1114,7 @@ function updateTestDashboard() {{
 
   document.getElementById(
     'metric-participants'
-  ).textContent = testRows.length;
+  ).textContent = participantRows.length;
 
   document.getElementById(
     'metric-completed'
