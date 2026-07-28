@@ -11,6 +11,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from .db import Database
 from .indigo import summarize_employee_result, try_sync_indigo_results
 from .mailer import send_html_email
+from .mail_templates import ensure_mail_templates, render_mail_template
 from .settings import Settings
 from .technical_alerts import notify_technical_error
 
@@ -69,24 +70,13 @@ def _employees_for_template(connection, template: dict):
     ).fetchall()
 
 
-def _render_reminder(settings: Settings, template: dict, employee, reminder_number: int) -> tuple[str, str]:
-    environment = Environment(loader=FileSystemLoader("/"), undefined=StrictUndefined, autoescape=True)
+def _render_reminder(settings: Settings, db: Database, template: dict, employee, reminder_number: int) -> tuple[str, str, bool]:
     context = {
         "fio": employee["fio"], "email": employee["email"], "login": employee["login"],
         "department": employee["department"], "position": employee["position"],
-        "reminder_number": reminder_number,
+        "reminder_number": reminder_number, "test_name": _template_name(template),
     }
-    reminder_template = template.get("reminder_body_template")
-    if reminder_template and Path(str(reminder_template)).exists():
-        body = environment.get_template(str(reminder_template)).render(**context)
-    else:
-        original = environment.get_template(template["body_template"]).render(**context)
-        body = (
-            "<p><strong>Напоминаем о необходимости пройти назначенное тестирование.</strong></p>"
-            + original
-        )
-    subject = str(template.get("reminder_subject") or f"Напоминание: {template['subject']}")
-    return subject, body
+    return render_mail_template(db, "reminder", str(template["id"]), context)
 
 
 def _create_queue_item(connection, employee, template: dict, reminder_count: int,
@@ -123,6 +113,7 @@ def _reviewer_body(row, template_name: str) -> str:
 
 def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                                               template_ids: set[str] | None = None) -> dict:
+    ensure_mail_templates(db, settings.templates)
     templates = {str(t["id"]): t for t in settings.templates}
     summary = {"delivered": 0, "pending": 0, "errors": 0}
     with db.connect() as connection:
@@ -163,11 +154,18 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                     delivered = True
                     continue
                 try:
-                    send_html_email(
-                        settings.smtp, reviewer["email"],
-                        f"Работник игнорирует прохождение теста «{_template_name(template)}»",
-                        _reviewer_body(row, _template_name(template)),
-                    )
+                    context = {
+                        "fio": row["fio"] or "Не указано", "email": row["email"] or "Не указан",
+                        "department": row["department"] or "Не указано", "position": row["position"] or "Не указана",
+                        "test_name": _template_name(template), "reminder_count": int(row["reminder_count"]),
+                        "first_reminder_at": row["first_reminder_at"] or "Не указано",
+                        "last_reminder_at": row["last_reminder_at"] or "Не указано",
+                    }
+                    subject, body, mail_enabled = render_mail_template(db, "reviewer", "*", context)
+                    if not mail_enabled:
+                        summary["pending"] += 1
+                        continue
+                    send_html_email(settings.smtp, reviewer["email"], subject, body)
                     connection.execute(
                         """INSERT INTO reviewer_delivery_attempts(queue_id, reviewer_id, recipient_email, attempted_at, status, error_text)
                            VALUES (?, ?, ?, ?, 'sent', NULL)""",
@@ -223,6 +221,7 @@ def cleanup_journal(db: Database) -> int:
 
 
 def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -> dict:
+    ensure_mail_templates(db, settings.templates)
     try_sync_indigo_results(settings, db)
     now = utc_now()
     summary = {"sent": 0, "skipped": 0, "escalated": 0, "errors": 0, "dry_run": dry_run}
@@ -302,7 +301,10 @@ def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -
                     continue
 
                 try:
-                    subject, body = _render_reminder(settings, template, employee, reminder_count + 1)
+                    subject, body, mail_enabled = _render_reminder(settings, db, template, employee, reminder_count + 1)
+                    if not mail_enabled:
+                        summary["skipped"] += 1
+                        continue
                     send_html_email(settings.smtp, email_address, subject, body)
                     connection.execute(
                         """INSERT INTO notification_history(worker_key, employment_seq, template_id, email, sent_at, status, method, error_text)

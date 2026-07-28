@@ -237,6 +237,18 @@ CREATE TABLE IF NOT EXISTS reviewer_delivery_attempts (
 CREATE INDEX IF NOT EXISTS idx_reviewer_delivery_queue
 ON reviewer_delivery_attempts(queue_id, reviewer_id, status);
 
+
+CREATE TABLE IF NOT EXISTS mail_templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    template_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body_html TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    UNIQUE(kind, template_id)
+);
+
 CREATE TABLE IF NOT EXISTS technical_errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     fingerprint TEXT NOT NULL,

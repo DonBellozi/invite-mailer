@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from sched import scheduler
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -62,9 +63,8 @@ def scheduler_mode(settings, db: Database) -> None:
     def fetch_job():
         try:
             path = fetch_and_import(settings, db)
-            reminder_summary = process_reminders(settings, db, dry_run=False)
             rebuild_report(settings, db, sync_indigo=False)
-            LOGGER.info("XLSX обработан: %s; напоминания: %s", path, json.dumps(reminder_summary, ensure_ascii=False))
+            LOGGER.info("XLSX обработан: %s", path)
         except Exception:
             LOGGER.exception("Ошибка ежедневного получения XLSX")
 
@@ -74,6 +74,37 @@ def scheduler_mode(settings, db: Database) -> None:
             LOGGER.info("Рассылка завершена: %s", json.dumps(summary, ensure_ascii=False))
         except Exception:
             LOGGER.exception("Ошибка еженедельной рассылки")
+
+    def reminder_job():
+        try:
+            local_now = datetime.now(ZoneInfo(timezone))
+            today = local_now.date().isoformat()
+            with db.connect() as connection:
+                values = {
+                    row["key"]: row["value"]
+                    for row in connection.execute(
+                        "SELECT key, value FROM app_settings WHERE key IN ('reminders_enabled','reminder_run_hour','reminder_run_minute','reminder_last_auto_run')"
+                    ).fetchall()
+                }
+            if values.get("reminders_enabled", "1") != "1":
+                return
+            hour = int(values.get("reminder_run_hour", "9"))
+            minute = int(values.get("reminder_run_minute", "15"))
+            if (local_now.hour, local_now.minute) < (hour, minute):
+                return
+            if values.get("reminder_last_auto_run") == today:
+                return
+            summary = process_reminders(settings, db, dry_run=False)
+            with db.connect() as connection:
+                connection.execute(
+                    "INSERT INTO app_settings(key,value,updated_at) VALUES('reminder_last_auto_run',?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    (today, local_now.isoformat()),
+                )
+            rebuild_report(settings, db, sync_indigo=False)
+            LOGGER.info("Автоматические напоминания: %s", json.dumps(summary, ensure_ascii=False))
+        except Exception:
+            LOGGER.exception("Ошибка автоматической отправки напоминаний")
 
     def indigo_job():
         try:
@@ -132,6 +163,15 @@ def scheduler_mode(settings, db: Database) -> None:
         id="weekly_send",
         replace_existing=True,
         max_instances=1,
+    )
+
+    scheduler.add_job(
+        reminder_job,
+        CronTrigger(minute="*", timezone=timezone),
+        id="automatic_reminders",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
 
     scheduler.add_job(

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from .db import Database
 from .mailer import send_html_email
+from .mail_templates import ensure_mail_templates, render_mail_template
 from .settings import Settings
 
 LOGGER = logging.getLogger("invite-mailer.technical-alerts")
@@ -102,15 +103,15 @@ def notify_technical_error(
     if not should_send:
         return False
 
-    lines = [
-        f"<p>ФИО: {html.escape(fio or 'Не указано')}</p>",
-        f"<p>E-mail: {html.escape(email_address or 'Не указан')}</p>",
-        f"<p>Тип ошибки: {html.escape(error_type)}</p>",
-    ]
-    if error_text:
-        lines.append(f"<pre style='white-space:pre-wrap'>{html.escape(error_text)}</pre>")
-    lines.append(f"<p>Дата обнаружения: {now.astimezone().strftime('%d.%m.%Y %H:%M')}</p>")
-    body = "".join(lines)
+    ensure_mail_templates(db, settings.templates)
+    context = {
+        "subject": subject, "fio": fio or "Не указано", "email": email_address or "Не указан",
+        "error_type": error_type, "error_text": error_text,
+        "detected_at": now.astimezone().strftime("%d.%m.%Y %H:%M"),
+    }
+    subject, body, mail_enabled = render_mail_template(db, "technical", "*", context)
+    if not mail_enabled:
+        return False
 
     delivered = 0
     failures: list[str] = []

@@ -15,6 +15,7 @@ from .identity import get_login_overrides
 from .imap_source import fetch_latest_attachment
 from .indigo import summarize_employee_result, try_sync_indigo_results
 from .mailer import send_html_email
+from .mail_templates import ensure_mail_templates, render_mail_template
 from .report import build_report
 from .settings import Settings
 from .technical_alerts import notify_technical_error
@@ -308,11 +309,7 @@ def fetch_and_import(settings: Settings, db: Database) -> Path:
 def send_notifications(settings: Settings, db: Database, dry_run: bool = False) -> dict:
     try_sync_indigo_results(settings, db)
     start = datetime.now()
-    environment = Environment(
-        loader=FileSystemLoader("/"),
-        undefined=StrictUndefined,
-        autoescape=True,
-    )
+    ensure_mail_templates(db, settings.templates)
 
     allowed_domains = {
         domain.lower() for domain in settings.config.get("mail", {}).get("allowed_domains", [])
@@ -383,19 +380,18 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
                     continue
 
                 try:
-                    body = environment.get_template(template["body_template"]).render(
-                        fio=employee["fio"],
-                        email=email_address,
-                        login=employee["login"],
-                        department=employee["department"],
-                        position=employee["position"],
+                    context = {
+                        "fio": employee["fio"], "email": email_address,
+                        "login": employee["login"], "department": employee["department"],
+                        "position": employee["position"], "test_name": template.get("name", template["id"]),
+                    }
+                    subject, body, mail_enabled = render_mail_template(
+                        db, "invitation", str(template["id"]), context
                     )
-                    send_html_email(
-                        settings.smtp,
-                        email_address,
-                        template["subject"],
-                        body,
-                    )
+                    if not mail_enabled:
+                        summary["skipped"] += 1
+                        continue
+                    send_html_email(settings.smtp, email_address, subject, body)
                     connection.execute(
                         """
                         INSERT INTO notification_history(

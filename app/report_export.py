@@ -43,6 +43,7 @@ PDF_MEDIA_TYPE = "application/pdf"
 @dataclass(frozen=True)
 class ExportRow:
     fio: str
+    email: str
     login: str
     department: str
     position: str
@@ -208,6 +209,7 @@ def build_test_export_report(
             export_rows.append(
                 ExportRow(
                     fio=str(employee["fio"] or ""),
+                    email=str(employee["email"] or ""),
                     login=str(employee["login"] or ""),
                     department=str(
                         employee["department"] or ""
@@ -362,7 +364,7 @@ def build_xlsx(
             start_row=row_number,
             start_column=1,
             end_row=row_number,
-            end_column=6,
+            end_column=7,
         )
 
     worksheet["A1"] = title_text
@@ -417,6 +419,7 @@ def build_xlsx(
 
     headers = (
         "ФИО",
+        "E-mail",
         "Логин",
         "Подразделение",
         "Должность",
@@ -490,6 +493,7 @@ def build_xlsx(
 
         values = (
             item.fio,
+            item.email,
             item.login,
             item.department,
             item.position,
@@ -522,7 +526,7 @@ def build_xlsx(
 
         status_cell = worksheet.cell(
             row=row_number,
-            column=5,
+            column=6,
         )
 
         status_cell.font = Font(
@@ -536,11 +540,12 @@ def build_xlsx(
 
     column_widths = {
         "A": 35,
-        "B": 20,
-        "C": 42,
-        "D": 46,
-        "E": 26,
-        "F": 18,
+        "B": 30,
+        "C": 20,
+        "D": 38,
+        "E": 42,
+        "F": 26,
+        "G": 18,
     }
 
     for column, width in (
@@ -561,7 +566,7 @@ def build_xlsx(
 
     worksheet.auto_filter.ref = (
         f"A{header_row}:"
-        f"F{last_row}"
+        f"G{last_row}"
     )
 
     worksheet.print_title_rows = (
@@ -569,7 +574,7 @@ def build_xlsx(
     )
 
     worksheet.print_area = (
-        f"A1:F{last_row}"
+        f"A1:G{last_row}"
     )
 
     worksheet.page_setup.orientation = (
@@ -799,6 +804,10 @@ def build_pdf(
                 table_header_style,
             ),
             _pdf_paragraph(
+                "E-mail",
+                table_header_style,
+            ),
+            _pdf_paragraph(
                 "Логин",
                 table_header_style,
             ),
@@ -833,6 +842,10 @@ def build_pdf(
                     table_cell_style,
                 ),
                 _pdf_paragraph(
+                    item.email,
+                    table_cell_style,
+                ),
+                _pdf_paragraph(
                     item.login,
                     table_cell_style,
                 ),
@@ -858,12 +871,13 @@ def build_pdf(
     table = LongTable(
         table_data,
         colWidths=[
+            40 * mm,
+            42 * mm,
+            24 * mm,
             48 * mm,
-            28 * mm,
             55 * mm,
-            65 * mm,
-            45 * mm,
-            26 * mm,
+            38 * mm,
+            22 * mm,
         ],
         repeatRows=1,
         hAlign="LEFT",
