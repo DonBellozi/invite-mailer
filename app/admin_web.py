@@ -131,6 +131,11 @@ def admin_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return ADMIN_HTML
 
 
+@app.get("/admin/settings/", response_class=HTMLResponse)
+def settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
+    return SETTINGS_HTML
+
+
 @app.get("/admin/logins/", response_class=HTMLResponse)
 def login_overrides_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return LOGIN_OVERRIDES_HTML
@@ -310,6 +315,246 @@ def health():
     return {"status": "ok"}
 
 
+SETTINGS_HTML = r"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Настройки</title>
+<style>
+body {
+  font-family: Arial, sans-serif;
+  margin: 24px;
+  color: #222;
+  background: #f5f6f8;
+}
+
+.card {
+  background: #fff;
+  border-radius: 10px;
+  padding: 18px;
+  margin-bottom: 18px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .08);
+}
+
+.page-header {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+
+.page-header-main {
+  flex: 1 1 auto;
+  min-width: 360px;
+  padding-right: 18px;
+  box-sizing: border-box;
+}
+
+.page-header-actions {
+  flex: 0 0 190px;
+  min-width: 190px;
+  padding-left: 18px;
+  border-left: 2px solid #e5e7eb;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-sizing: border-box;
+}
+
+.header-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 38px;
+  box-sizing: border-box;
+  padding: 9px 13px;
+  border: 1px solid #98a2b3;
+  border-radius: 7px;
+  color: #344054;
+  text-decoration: none;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  background: #fff;
+}
+
+.header-button:hover {
+  background: #f2f4f7;
+}
+
+h1 {
+  margin: 0 0 8px;
+  font-size: 24px;
+}
+
+.small {
+  color: #667085;
+  font-size: 12px;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  gap: 18px;
+}
+
+.settings-item {
+  display: flex;
+  flex-direction: column;
+  min-height: 160px;
+  padding: 18px;
+  border: 1px solid #e1e5ea;
+  border-radius: 10px;
+  background: #fff;
+  box-sizing: border-box;
+}
+
+.settings-item h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.settings-item p {
+  margin: 0 0 18px;
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.settings-item .item-action {
+  margin-top: auto;
+}
+
+.settings-link,
+.settings-disabled {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  padding: 9px 13px;
+  border-radius: 7px;
+  box-sizing: border-box;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.settings-link {
+  border: 1px solid #175cd3;
+  color: #fff;
+  background: #175cd3;
+  text-decoration: none;
+}
+
+.settings-link:hover {
+  background: #1849a9;
+}
+
+.settings-disabled {
+  border: 1px solid #d0d5dd;
+  color: #667085;
+  background: #f2f4f7;
+}
+
+@media (max-width: 900px) {
+  .page-header {
+    flex-wrap: wrap;
+    gap: 14px;
+  }
+
+  .page-header-main {
+    flex: 1 1 100%;
+    min-width: 100%;
+    padding-right: 0;
+  }
+
+  .page-header-actions {
+    flex: 1 1 220px;
+    min-width: 220px;
+    padding: 14px 0 0;
+    border-left: 0;
+    border-top: 2px solid #e5e7eb;
+  }
+
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="page-header">
+    <div class="page-header-main">
+      <h1>Настройки</h1>
+      <div class="small">
+        Управление параметрами рассылки, проверяющими,
+        сопоставлением логинов и почтовыми шаблонами.
+      </div>
+    </div>
+
+    <div class="page-header-actions">
+      <a class="header-button" href="/admin/">
+        Импорт участников
+      </a>
+      <a class="header-button" href="/">
+        Вернуться к отчету
+      </a>
+    </div>
+  </div>
+</div>
+
+<div class="settings-grid">
+  <section class="settings-item">
+    <h2>Общие настройки</h2>
+    <p>
+      Интервалы напоминаний, правила повторной отправки
+      и другие общие параметры работы сервиса.
+    </p>
+    <div class="item-action">
+      <span class="settings-disabled">Будет добавлено в v2.0.2</span>
+    </div>
+  </section>
+
+  <section class="settings-item">
+    <h2>Проверяющие</h2>
+    <p>
+      Адресаты служебных уведомлений и параметры отправки
+      списка работников, не прошедших тестирование.
+    </p>
+    <div class="item-action">
+      <span class="settings-disabled">Будет добавлено в v2.0.2</span>
+    </div>
+  </section>
+
+  <section class="settings-item">
+    <h2>Сопоставление логинов</h2>
+    <p>
+      Ручное сопоставление e-mail работников с логинами Indigo,
+      когда логин отличается от части адреса до знака @.
+    </p>
+    <div class="item-action">
+      <a class="settings-link" href="/admin/logins/">
+        Открыть сопоставления
+      </a>
+    </div>
+  </section>
+
+  <section class="settings-item">
+    <h2>Шаблоны</h2>
+    <p>
+      Темы и тексты приглашений, напоминаний
+      и уведомлений проверяющим.
+    </p>
+    <div class="item-action">
+      <span class="settings-disabled">Будет добавлено в v2.0.3</span>
+    </div>
+  </section>
+</div>
+</body>
+</html>"""
+
+
 LOGIN_OVERRIDES_HTML = r"""<!doctype html>
 <html lang="ru">
 <head>
@@ -442,9 +687,9 @@ th { background: #f0f2f5; }
     <div class="page-header-actions">
       <a
         class="header-button"
-        href="/admin/"
+        href="/admin/settings/"
       >
-        Импорт участников
+        ⚙ Настройки
       </a>
 
       <a
@@ -851,9 +1096,9 @@ tr.error { background: #fff5f5; }
     <div class="page-header-actions">
       <a
         class="header-button"
-        href="/admin/logins/"
+        href="/admin/settings/"
       >
-        Сопоставление логинов
+        ⚙ Настройки
       </a>
 
       <a

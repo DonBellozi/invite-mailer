@@ -937,9 +937,9 @@ def build_report(
 
       <a
         class="admin-link"
-        href="/admin/logins/"
+        href="/admin/settings/"
       >
-        Сопоставление логинов
+        ⚙ Настройки
       </a>
     </aside>
 
