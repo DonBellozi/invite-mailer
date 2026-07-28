@@ -26,14 +26,24 @@ def _read_setting(connection, key: str, default: str = "") -> str:
 
 def technical_settings(db: Database) -> dict:
     with db.connect() as connection:
-        enabled = _read_setting(connection, "technical_notifications_enabled", "0") == "1"
-        email = _read_setting(connection, "technical_email", "").strip()
         repeat_hours_raw = _read_setting(connection, "technical_repeat_hours", "72")
         try:
             repeat_hours = max(1, int(repeat_hours_raw))
         except ValueError:
             repeat_hours = 72
-    return {"enabled": enabled, "email": email, "repeat_hours": repeat_hours}
+        recipients = [
+            {"name": str(row["name"]), "email": str(row["email"]).strip()}
+            for row in connection.execute(
+                """
+                SELECT name, email
+                FROM reviewers
+                WHERE enabled = 1 AND receives_technical_errors = 1
+                ORDER BY name COLLATE NOCASE, email COLLATE NOCASE
+                """
+            ).fetchall()
+            if str(row["email"]).strip()
+        ]
+    return {"recipients": recipients, "repeat_hours": repeat_hours}
 
 
 def _fingerprint(error_type: str, employee_email: str, error_text: str) -> str:
@@ -67,7 +77,7 @@ def notify_technical_error(
             (fingerprint,),
         ).fetchone()
 
-        should_send = bool(config["enabled"] and config["email"])
+        should_send = bool(config["recipients"])
         if previous and previous["notified_at"]:
             try:
                 notified_at = datetime.fromisoformat(previous["notified_at"])
@@ -102,20 +112,23 @@ def notify_technical_error(
     lines.append(f"<p>Дата обнаружения: {now.astimezone().strftime('%d.%m.%Y %H:%M')}</p>")
     body = "".join(lines)
 
-    try:
-        send_html_email(settings.smtp, config["email"], subject, body)
-    except Exception as error:
-        LOGGER.exception("Не удалось отправить техническое уведомление")
-        with db.connect() as connection:
-            connection.execute(
-                "UPDATE technical_errors SET notification_error = ? WHERE id = ?",
-                (str(error), row_id),
-            )
-        return False
+    delivered = 0
+    failures: list[str] = []
+    for recipient in config["recipients"]:
+        try:
+            send_html_email(settings.smtp, recipient["email"], subject, body)
+            delivered += 1
+        except Exception as error:
+            LOGGER.exception("Не удалось отправить техническое уведомление на %s", recipient["email"])
+            failures.append(f"{recipient['name']} <{recipient['email']}>: {error}")
 
     with db.connect() as connection:
         connection.execute(
-            "UPDATE technical_errors SET notified_at = ? WHERE id = ?",
-            (now_iso, row_id),
+            "UPDATE technical_errors SET notified_at = ?, notification_error = ? WHERE id = ?",
+            (
+                now_iso if delivered else None,
+                "\n".join(failures) if failures else None,
+                row_id,
+            ),
         )
-    return True
+    return delivered > 0
