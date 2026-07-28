@@ -7,12 +7,22 @@ from typing import Any
 from .db import Database
 from .settings import Settings
 
+MIGRATION_KEY = "test_definitions_yaml_import_v1"
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _json(values: Any, default: list[str]) -> str:
+    return json.dumps(values if isinstance(values, list) and values else default, ensure_ascii=False)
+
+
 def ensure_test_definitions(db: Database, legacy_templates: list[dict[str, Any]]) -> None:
+    """Однократно переносит определения тестов из YAML в SQLite.
+
+    Повторные запуски не перезаписывают данные, измененные через Web.
+    """
     with db.connect() as connection:
         connection.execute(
             """
@@ -34,34 +44,55 @@ def ensure_test_definitions(db: Database, legacy_templates: list[dict[str, Any]]
             )
             """
         )
+        done = connection.execute("SELECT value FROM app_state WHERE key=?", (MIGRATION_KEY,)).fetchone()
+        if done:
+            return
         now = _now()
+        imported = 0
         for item in legacy_templates:
+            if not item.get("id"):
+                continue
             audience = item.get("audience") or {}
             audience_type = "explicit_list" if str(audience.get("type", "")).strip().lower() == "explicit_list" else "all"
             departments = item.get("departments") or {}
             indigo = item.get("indigo") or {}
-            connection.execute(
+            cur = connection.execute(
                 """
-                INSERT OR IGNORE INTO test_definitions(
+                INSERT INTO test_definitions(
                     id, enabled, name, mode, validity_days, audience_type,
                     departments_include_json, departments_exclude_json,
                     indigo_logical_test_id, indigo_test_name,
                     indigo_success_results_json, indigo_failed_prefixes_json,
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    enabled=excluded.enabled, name=excluded.name, mode=excluded.mode,
+                    validity_days=excluded.validity_days, audience_type=excluded.audience_type,
+                    departments_include_json=excluded.departments_include_json,
+                    departments_exclude_json=excluded.departments_exclude_json,
+                    indigo_logical_test_id=excluded.indigo_logical_test_id,
+                    indigo_test_name=excluded.indigo_test_name,
+                    indigo_success_results_json=excluded.indigo_success_results_json,
+                    indigo_failed_prefixes_json=excluded.indigo_failed_prefixes_json,
+                    updated_at=excluded.updated_at
                 """,
                 (
                     str(item["id"]), int(bool(item.get("enabled", True))),
                     str(item.get("name") or item["id"]), str(item.get("mode") or "once"),
                     item.get("validity_days"), audience_type,
-                    json.dumps(departments.get("include") or ["*"], ensure_ascii=False),
-                    json.dumps(departments.get("exclude") or [], ensure_ascii=False),
+                    _json(departments.get("include"), ["*"]),
+                    _json(departments.get("exclude"), []),
                     indigo.get("logical_test_id"), indigo.get("test_name"),
-                    json.dumps(indigo.get("success_results") or [], ensure_ascii=False),
-                    json.dumps(indigo.get("failed_result_prefixes") or [], ensure_ascii=False),
+                    _json(indigo.get("success_results"), []),
+                    _json(indigo.get("failed_result_prefixes"), []),
                     now, now,
                 ),
             )
+            imported += cur.rowcount
+        connection.execute(
+            "INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (MIGRATION_KEY, json.dumps({"at": now, "imported": imported}, ensure_ascii=False)),
+        )
         connection.commit()
 
 
@@ -76,10 +107,8 @@ def _json_list(value: str | None, default: list[str]) -> list[str]:
 def row_to_template(row: Any, legacy: dict[str, Any] | None = None) -> dict[str, Any]:
     legacy = legacy or {}
     template: dict[str, Any] = {
-        "id": str(row["id"]),
-        "enabled": bool(row["enabled"]),
-        "name": str(row["name"]),
-        "mode": str(row["mode"] or "once"),
+        "id": str(row["id"]), "enabled": bool(row["enabled"]),
+        "name": str(row["name"]), "mode": str(row["mode"] or "once"),
         "validity_days": row["validity_days"],
     }
     for key in ("subject", "body_template", "reminder_subject", "reminder_body_template"):

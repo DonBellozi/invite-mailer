@@ -213,6 +213,64 @@ def try_sync_indigo_results(settings: Settings, db: Database) -> bool:
         return False
 
 
+
+def ensure_indigo_test_catalog(db: Database) -> None:
+    with db.connect() as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS indigo_test_catalog (
+                logical_test_id INTEGER NOT NULL,
+                test_name TEXT NOT NULL,
+                source_rows INTEGER NOT NULL DEFAULT 0,
+                refreshed_at TEXT NOT NULL,
+                PRIMARY KEY(logical_test_id, test_name)
+            )
+        """)
+
+
+def refresh_indigo_test_catalog(settings: Settings, db: Database) -> list[dict]:
+    ensure_indigo_test_catalog(db)
+    if not settings.indigo.enabled:
+        raise RuntimeError("Подключение к Indigo отключено")
+    if not VIEW_RE.match(settings.indigo.view):
+        raise RuntimeError("Некорректное имя представления Indigo")
+    import psycopg2
+    query = f"""
+        SELECT COALESCE(ph_test_id, test_id) AS logical_test_id, test_name, COUNT(*)
+        FROM {settings.indigo.view}
+        WHERE test_name IS NOT NULL AND trim(test_name) <> ''
+          AND COALESCE(ph_test_id, test_id) IS NOT NULL
+        GROUP BY COALESCE(ph_test_id, test_id), test_name
+        ORDER BY test_name, logical_test_id
+    """
+    with psycopg2.connect(
+        host=settings.indigo.host, port=settings.indigo.port, dbname=settings.indigo.database,
+        user=settings.indigo.username, password=settings.indigo.password, sslmode=settings.indigo.sslmode,
+        connect_timeout=settings.indigo.connect_timeout, application_name="invite-mailer-catalog-readonly",
+    ) as remote:
+        remote.set_session(readonly=True, autocommit=True)
+        with remote.cursor() as cursor:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+    refreshed = _now_iso()
+    with db.connect() as connection:
+        connection.execute("DELETE FROM indigo_test_catalog")
+        connection.executemany(
+            "INSERT INTO indigo_test_catalog(logical_test_id,test_name,source_rows,refreshed_at) VALUES(?,?,?,?)",
+            [(int(r[0]), str(r[1]), int(r[2]), refreshed) for r in rows],
+        )
+        connection.execute("INSERT INTO app_state(key,value) VALUES('indigo_catalog_last_refresh',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (refreshed,))
+        connection.execute("DELETE FROM app_state WHERE key='indigo_catalog_last_error'")
+    return [{"logical_test_id": int(r[0]), "test_name": str(r[1]), "source_rows": int(r[2])} for r in rows]
+
+
+def get_indigo_test_catalog(db: Database) -> dict:
+    ensure_indigo_test_catalog(db)
+    with db.connect() as connection:
+        rows = connection.execute("SELECT * FROM indigo_test_catalog ORDER BY test_name COLLATE NOCASE, logical_test_id").fetchall()
+        stamp = connection.execute("SELECT value FROM app_state WHERE key='indigo_catalog_last_refresh'").fetchone()
+        error = connection.execute("SELECT value FROM app_state WHERE key='indigo_catalog_last_error'").fetchone()
+    return {"items": [dict(r) for r in rows], "refreshed_at": stamp["value"] if stamp else None, "error": error["value"] if error else None}
+
 def _parse_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
