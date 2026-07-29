@@ -24,15 +24,30 @@ def _bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _load_login_overrides() -> dict[str, str]:
-    """Загружает прежние исключения из окружения для переноса в SQLite.
+def _load_login_overrides(config: dict[str, Any]) -> dict[str, str]:
+    """Загружает прежние исключения для однократного переноса в SQLite.
 
-    Основным источником является таблица login_overrides. Переменная
-    LOGIN_OVERRIDES_JSON сохранена только для обратной совместимости.
+    После обновления основным источником становится таблица login_overrides.
+    YAML и LOGIN_OVERRIDES_JSON сохранены для обратной совместимости и
+    импортируются только для отсутствующих записей.
     """
+    overrides: dict[str, str] = {}
+
+    overrides_path = config.get("identity", {}).get(
+        "overrides_file", str(ROOT / "config/login_overrides.yaml")
+    )
+    overrides_file = Path(overrides_path)
+    if overrides_file.exists():
+        overrides_data = _read_yaml(overrides_file)
+        for item in overrides_data.get("overrides", []):
+            email = str(item.get("email", "")).strip().lower()
+            login = str(item.get("login", "")).strip().lower()
+            if email and login:
+                overrides[email] = login
+
     raw_json = os.getenv("LOGIN_OVERRIDES_JSON", "").strip()
     if not raw_json:
-        return {}
+        return overrides
 
     try:
         environment_overrides = json.loads(raw_json)
@@ -48,7 +63,6 @@ def _load_login_overrides() -> dict[str, str]:
             '{"email@domain.ru":"login"}'
         )
 
-    overrides: dict[str, str] = {}
     for email_address, login_value in environment_overrides.items():
         email = str(email_address).strip().lower()
         login = str(login_value).strip().lower()
@@ -138,9 +152,11 @@ class Settings:
 
 def load_settings() -> Settings:
     config_path = os.getenv("CONFIG_PATH", str(ROOT / "config/config.yaml"))
+    templates_path = os.getenv("TEMPLATES_PATH", str(ROOT / "config/templates.yaml"))
 
     config = _read_yaml(config_path)
-    overrides = _load_login_overrides()
+    templates_data = _read_yaml(templates_path)
+    overrides = _load_login_overrides(config)
 
     imap = ImapSettings(
         host=os.environ["IMAP_HOST"],
@@ -154,12 +170,12 @@ def load_settings() -> Settings:
     )
 
     smtp = SmtpSettings(
-        host=os.environ["SMTP_HOST"],
+        host=os.getenv("SMTP_HOST", ""),
         port=int(os.getenv("SMTP_PORT", "465")),
         mode=os.getenv("SMTP_MODE", "ssl").strip().lower(),
         username=os.getenv("SMTP_USERNAME", ""),
         password=os.getenv("SMTP_PASSWORD", ""),
-        from_email=os.environ["SMTP_FROM_EMAIL"],
+        from_email=os.getenv("SMTP_FROM_EMAIL", ""),
         from_name=os.getenv("SMTP_FROM_NAME", "Система тестирования"),
     )
 
@@ -188,7 +204,7 @@ def load_settings() -> Settings:
         ),
         view=str(indigo_config.get("view", "res.results_view")).strip(),
     )
-    indigo.validate()
+    # Полная проверка выполняется после применения настроек из SQLite.
 
     secret = os.getenv("WORKER_HASH_SECRET", "")
     if len(secret) < 16:
@@ -196,7 +212,7 @@ def load_settings() -> Settings:
 
     return Settings(
         config=config,
-        templates=[],
+        templates=templates_data.get("templates", []),
         login_overrides=overrides,
         imap=imap,
         smtp=smtp,

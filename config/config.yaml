@@ -32,6 +32,8 @@ xlsx:
 identity:
   login_source: "email_localpart"
   lowercase: true
+  # Резервный YAML-файл. Значения LOGIN_OVERRIDES_JSON из Portainer имеют приоритет.
+  overrides_file: "/opt/invite-mailer/config/login_overrides.yaml"
 
 mail:
   send_delay_seconds: 0.3

@@ -22,6 +22,7 @@ from .logic import (
     send_notifications,
 )
 from .settings import load_settings
+from .runtime_settings import bootstrap_runtime_settings
 from .reminders import process_reminders
 from .technical_alerts import dispatch_technical_error_digest
 
@@ -201,6 +202,7 @@ def main() -> int:
     args = parser().parse_args()
     settings = load_settings()
     db = Database(settings.database_path)
+    bootstrap_runtime_settings(settings, db)
     bootstrap_legacy_overrides(settings, db)
 
     if args.command == "scheduler":
