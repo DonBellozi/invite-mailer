@@ -8,3 +8,4 @@ PyYAML==6.0.2
 reportlab==5.0.0
 ttf-opensans==2020.10.30
 uvicorn==0.34.0
+itsdangerous==2.2.0
