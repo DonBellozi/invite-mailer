@@ -1,39 +1,82 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
 
 from jinja2 import Environment, StrictUndefined
 
 from .db import Database
 
 
+DEFAULT_INVITATION_BODY = """<!doctype html>
+<html lang="ru">
+  <body style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.5; color: #222;">
+    <p>Здравствуйте, {{ fio }}!</p>
+    <p>Вам назначено обязательное тестирование <strong>«{{ test_name }}»</strong>.</p>
+    <p>Просим пройти тестирование в установленный срок.</p>
+  </body>
+</html>"""
+
+DEFAULT_REMINDER_BODY = """<!doctype html>
+<html lang="ru">
+  <body style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.5; color: #222;">
+    <p>Здравствуйте, {{ fio }}!</p>
+    <p>Напоминаем о необходимости пройти тестирование <strong>«{{ test_name }}»</strong>.</p>
+    <p>Просим завершить тестирование в установленный срок.</p>
+  </body>
+</html>"""
+
+INITIAL_TEST_MAIL: dict[str, dict[str, str]] = {
+    "antiterror": {
+        "invitation_subject": (
+            "Обязательное прохождение курса и тестирования "
+            "по антитеррористической безопасности"
+        ),
+        "reminder_subject": (
+            "Напоминание о прохождении курса и тестирования "
+            "по антитеррористической безопасности"
+        ),
+    },
+    "anticorruption": {
+        "invitation_subject": (
+            "Обязательное прохождение тренинга и тестирования "
+            "по антикоррупционной безопасности"
+        ),
+        "reminder_subject": (
+            "Напоминание о прохождении тренинга и тестирования "
+            "по антикоррупционной безопасности"
+        ),
+    },
+}
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _read_file(path: Any) -> str:
-    try:
-        p = Path(str(path))
-        return p.read_text(encoding="utf-8") if p.exists() else ""
-    except Exception:
-        return ""
-
-
 def ensure_mail_templates(db: Database, templates: list[dict]) -> None:
     defaults: list[tuple[str, str, str, str, int]] = []
+
     for template in templates:
         tid = str(template["id"])
         name = str(template.get("name") or tid)
-        original = _read_file(template.get("body_template"))
-        if not original:
-            original = "<p>Здравствуйте, {{ fio }}!</p><p>Вам назначено обязательное тестирование.</p>"
-        defaults.append(("invitation", tid, str(template.get("subject") or name), original, 1))
-        reminder_body = _read_file(template.get("reminder_body_template")) or (
-            "<p><strong>Напоминаем о необходимости пройти назначенное тестирование.</strong></p>" + original
+        initial = INITIAL_TEST_MAIL.get(tid, {})
+
+        invitation_subject = initial.get(
+            "invitation_subject",
+            f"Приглашение к прохождению тестирования – {name}",
         )
-        defaults.append(("reminder", tid, str(template.get("reminder_subject") or f"Напоминание: {template.get('subject') or name}"), reminder_body, 1))
+        reminder_subject = initial.get(
+            "reminder_subject",
+            f"Напоминание о прохождении тестирования – {name}",
+        )
+
+        defaults.append(
+            ("invitation", tid, invitation_subject, DEFAULT_INVITATION_BODY, 1)
+        )
+        defaults.append(
+            ("reminder", tid, reminder_subject, DEFAULT_REMINDER_BODY, 1)
+        )
+
     defaults.extend([
         ("reviewer", "*", "Требуется контроль прохождения тестирования – {{ test_name }}",
          "<p>Здравствуйте!</p>"
@@ -63,38 +106,74 @@ def ensure_mail_templates(db: Database, templates: list[dict]) -> None:
          "<p style='margin:0'><strong>Дата обнаружения:</strong> {{ error.detected_at }}</p>"
          "</div>{% endfor %}", 1),
     ])
+
     with db.connect() as c:
         for kind, tid, subject, body, enabled in defaults:
-            c.execute("""INSERT OR IGNORE INTO mail_templates(kind, template_id, subject, body_html, enabled, updated_at)
-                         VALUES (?, ?, ?, ?, ?, ?)""", (kind, tid, subject, body, enabled, _now()))
+            c.execute(
+                """INSERT OR IGNORE INTO mail_templates(
+                       kind, template_id, subject, body_html, enabled, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (kind, tid, subject, body, enabled, _now()),
+            )
+
         # Однократное безопасное обновление прежнего стандартного технического шаблона.
         # Пользовательские шаблоны не изменяются.
         old_technical_body = "<p>ФИО: {{ fio }}</p><p>E-mail: {{ email }}</p><p>Тип ошибки: {{ error_type }}</p>{% if error_text %}<pre style='white-space:pre-wrap'>{{ error_text }}</pre>{% endif %}<p>Дата обнаружения: {{ detected_at }}</p>"
-        new_technical_body = next(body for kind, tid, _subject, body, _enabled in defaults if kind == "technical" and tid == "*")
+        new_technical_body = next(
+            body
+            for kind, tid, _subject, body, _enabled in defaults
+            if kind == "technical" and tid == "*"
+        )
         c.execute(
             """UPDATE mail_templates SET body_html = ?, updated_at = ?
                WHERE kind = 'technical' AND template_id = '*' AND body_html = ?""",
             (new_technical_body, _now(), old_technical_body),
         )
+
         # Однократное безопасное обновление прежнего стандартного шаблона контролирующих.
         # Пользовательские шаблоны не изменяются.
         old_reviewer_subject = "Работник игнорирует прохождение теста «{{ test_name }}»"
         old_reviewer_body = "<p>Работник не завершил обязательное тестирование после всех предусмотренных напоминаний.</p><p>ФИО: {{ fio }}<br>E-mail: {{ email }}<br>Подразделение: {{ department }}<br>Должность: {{ position }}<br>Тест: {{ test_name }}<br>Количество напоминаний: {{ reminder_count }}<br>Первое напоминание: {{ first_reminder_at }}<br>Последнее напоминание: {{ last_reminder_at }}</p>"
-        new_reviewer = next((subject, body) for kind, tid, subject, body, _enabled in defaults if kind == "reviewer" and tid == "*")
+        new_reviewer = next(
+            (subject, body)
+            for kind, tid, subject, body, _enabled in defaults
+            if kind == "reviewer" and tid == "*"
+        )
         c.execute(
             """UPDATE mail_templates SET subject = ?, body_html = ?, updated_at = ?
-               WHERE kind = 'reviewer' AND template_id = '*' AND subject = ? AND body_html = ?""",
-            (new_reviewer[0], new_reviewer[1], _now(), old_reviewer_subject, old_reviewer_body),
+               WHERE kind = 'reviewer' AND template_id = '*'
+                 AND subject = ? AND body_html = ?""",
+            (
+                new_reviewer[0],
+                new_reviewer[1],
+                _now(),
+                old_reviewer_subject,
+                old_reviewer_body,
+            ),
         )
 
 
 def get_mail_template(db: Database, kind: str, template_id: str = "*") -> dict:
     with db.connect() as c:
-        row = c.execute("SELECT * FROM mail_templates WHERE kind=? AND template_id=?", (kind, template_id)).fetchone()
-    return dict(row) if row else {"kind": kind, "template_id": template_id, "subject": "", "body_html": "", "enabled": 0}
+        row = c.execute(
+            "SELECT * FROM mail_templates WHERE kind=? AND template_id=?",
+            (kind, template_id),
+        ).fetchone()
+    return dict(row) if row else {
+        "kind": kind,
+        "template_id": template_id,
+        "subject": "",
+        "body_html": "",
+        "enabled": 0,
+    }
 
 
-def render_mail_template(db: Database, kind: str, template_id: str, context: dict) -> tuple[str, str, bool]:
+def render_mail_template(
+    db: Database,
+    kind: str,
+    template_id: str,
+    context: dict,
+) -> tuple[str, str, bool]:
     item = get_mail_template(db, kind, template_id)
     env = Environment(undefined=StrictUndefined, autoescape=True)
     subject = env.from_string(str(item["subject"])).render(**context)

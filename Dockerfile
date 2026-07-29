@@ -15,6 +15,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY config ./config
-COPY templates ./templates
 
 CMD ["python", "-m", "app.main", "scheduler"]
