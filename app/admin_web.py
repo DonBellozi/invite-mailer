@@ -6,11 +6,11 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from openpyxl import Workbook
+from starlette.middleware.sessions import SessionMiddleware
 
 from .audience import (
     AudienceImportError,
@@ -53,8 +53,15 @@ from .audience_template import (
 )
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-security = HTTPBasic(auto_error=False)
 app = FastAPI(title="Invite Mailer Admin", docs_url=None, redoc_url=None)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET") or os.getenv("WORKER_HASH_SECRET", "invite-mailer-local-session-secret"),
+    session_cookie="invite_mailer_session",
+    max_age=int(os.getenv("SESSION_MAX_AGE_SECONDS", "28800")),
+    same_site="lax",
+    https_only=os.getenv("SESSION_COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes", "on"},
+)
 
 _settings: Settings | None = None
 _db: Database | None = None
@@ -209,34 +216,35 @@ def _write_setting(key: str, value: str) -> None:
         connection.commit()
 
 
-def require_admin(
-    credentials: Annotated[HTTPBasicCredentials | None, Depends(security)],
-) -> str:
-    expected_username = os.getenv("ADMIN_USERNAME", "").strip()
-    expected_password = os.getenv("ADMIN_PASSWORD", "")
+def _safe_next(value: str | None) -> str:
+    candidate = (value or "/").strip()
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return "/"
+    return candidate
 
-    if not expected_username or not expected_password:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Не заданы ADMIN_USERNAME и ADMIN_PASSWORD",
-        )
 
-    if credentials is None:
+def _display_name(username: str) -> str:
+    configured = os.getenv("ADMIN_DISPLAY_NAME", "").strip()
+    return configured or username
+
+
+def require_admin(request: Request) -> str:
+    username = str(request.session.get("username", "")).strip()
+    if username:
+        return username
+
+    if request.url.path.startswith("/api/"):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Требуется авторизация",
-            headers={"WWW-Authenticate": "Basic"},
         )
 
-    username_ok = secrets.compare_digest(credentials.username, expected_username)
-    password_ok = secrets.compare_digest(credentials.password, expected_password)
-    if not username_ok or not password_ok:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Неверный логин или пароль",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials.username
+    next_url = _safe_next(request.url.path)
+    raise HTTPException(
+        status_code=status.HTTP_303_SEE_OTHER,
+        detail="Требуется авторизация",
+        headers={"Location": f"/login?next={next_url}"},
+    )
 
 
 class ConfirmRequest(BaseModel):
@@ -331,6 +339,55 @@ def find_report_template(
         status_code=404,
         detail="Шаблон теста не найден",
     )
+
+
+LOGIN_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход</title><style>body{font-family:Arial,sans-serif;margin:0;background:#f5f6f8;color:#222;min-height:100vh;display:grid;place-items:center}.card{width:min(420px,calc(100% - 32px));background:#fff;border-radius:12px;padding:24px;box-sizing:border-box;box-shadow:0 2px 12px rgba(0,0,0,.12)}h1{margin:0 0 8px;font-size:24px}.small{margin:0 0 20px;color:#667085;font-size:13px;line-height:1.45}label{display:block;margin:14px 0 6px;font-size:13px;font-weight:600}input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #98a2b3;border-radius:7px;font-size:14px}.button{width:100%;margin-top:18px;padding:10px 14px;border:1px solid #175cd3;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.error{margin-top:14px;padding:10px 12px;border-radius:7px;background:#fef3f2;color:#b42318;font-size:13px}.back{display:block;margin-top:14px;text-align:center;color:#475467;text-decoration:none;font-size:13px}</style></head><body><main class="card"><h1>Вход</h1><p class="small">Используйте встроенную учетную запись Invite Mailer.</p><form method="post" action="/login"><input type="hidden" name="next" value="__NEXT__"><label for="username">Логин</label><input id="username" name="username" autocomplete="username" required autofocus><label for="password">Пароль</label><input id="password" name="password" type="password" autocomplete="current-password" required><button class="button" type="submit">Войти</button></form>__ERROR__<a class="back" href="/">Вернуться к отчету</a></main></body></html>"""
+
+
+def _login_html(next_url: str, error: str = "") -> str:
+    import html
+    error_html = f'<div class="error">{html.escape(error)}</div>' if error else ""
+    return LOGIN_HTML.replace("__NEXT__", html.escape(_safe_next(next_url), quote=True)).replace("__ERROR__", error_html)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request, next: str = "/"):
+    if request.session.get("username"):
+        return RedirectResponse(_safe_next(next), status_code=status.HTTP_303_SEE_OTHER)
+    return _login_html(next)
+
+
+@app.post("/login", response_class=HTMLResponse)
+def login_submit(request: Request, username: Annotated[str, Form()], password: Annotated[str, Form()], next: Annotated[str, Form()] = "/"):
+    expected_username = os.getenv("ADMIN_USERNAME", "").strip()
+    expected_password = os.getenv("ADMIN_PASSWORD", "")
+    if not expected_username or not expected_password:
+        return HTMLResponse(_login_html(next, "Не заданы ADMIN_USERNAME и ADMIN_PASSWORD"), status_code=503)
+    username_ok = secrets.compare_digest(username.strip(), expected_username)
+    password_ok = secrets.compare_digest(password, expected_password)
+    if not username_ok or not password_ok:
+        return HTMLResponse(_login_html(next, "Неверный логин или пароль"), status_code=401)
+    request.session.clear()
+    request.session["username"] = expected_username
+    request.session["display_name"] = _display_name(expected_username)
+    return RedirectResponse(_safe_next(next), status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    username = str(request.session.get("username", "")).strip()
+    return {
+        "authenticated": bool(username),
+        "username": username,
+        "display_name": str(request.session.get("display_name", "")).strip() or (_display_name(username) if username else ""),
+        "role": "Администратор" if username else "",
+    }
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
+    request.session.clear()
+    return {"ok": True}
 
 
 @app.exception_handler(AudienceImportError)

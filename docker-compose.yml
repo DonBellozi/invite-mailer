@@ -33,6 +33,10 @@ x-app-environment: &app-environment
 
   ADMIN_USERNAME: "${ADMIN_USERNAME}"
   ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
+  ADMIN_DISPLAY_NAME: "${ADMIN_DISPLAY_NAME:-}"
+  SESSION_SECRET: "${SESSION_SECRET}"
+  SESSION_MAX_AGE_SECONDS: "${SESSION_MAX_AGE_SECONDS:-28800}"
+  SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-false}"
 
 x-app-volumes: &app-volumes
   - "${STORAGE_ROOT}/data:/opt/invite-mailer/data"

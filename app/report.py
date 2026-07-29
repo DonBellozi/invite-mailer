@@ -94,6 +94,18 @@ h2.dashboard-title {
   background: #f2f4f7;
 }
 
+.auth-link .auth-hover {
+  display: none;
+}
+
+.auth-link.authenticated:hover .auth-name {
+  display: none;
+}
+
+.auth-link.authenticated:hover .auth-hover {
+  display: inline;
+}
+
 .test-header-line {
   display: flex;
   align-items: flex-start;
@@ -969,6 +981,16 @@ def build_report(
       >
         ⚙ Настройки
       </a>
+
+      <a
+        id="auth-action"
+        class="admin-link auth-link"
+        href="/login?next=/"
+        title="Войти"
+      >
+        <span class="auth-name">Войти</span>
+        <span class="auth-hover">Выйти</span>
+      </a>
     </aside>
 
   </div>
@@ -1236,6 +1258,35 @@ statusFilter.addEventListener(
 );
 
 applyFilters();
+
+const authAction = document.getElementById('auth-action');
+
+async function refreshAuthAction() {{
+  try {{
+    const response = await fetch('/api/auth/me', {{credentials: 'same-origin'}});
+    const state = await response.json();
+    if (!state.authenticated) return;
+
+    authAction.classList.add('authenticated');
+    authAction.title = 'Выйти';
+    authAction.href = '#';
+    authAction.querySelector('.auth-name').textContent =
+      state.display_name || state.username;
+
+    authAction.addEventListener('click', async event => {{
+      event.preventDefault();
+      await fetch('/api/auth/logout', {{
+        method: 'POST',
+        credentials: 'same-origin'
+      }});
+      window.location.reload();
+    }});
+  }} catch (_) {{
+    // Отчет остается доступным даже при временной недоступности API.
+  }}
+}}
+
+refreshAuthAction();
 </script>
 
 </body>
