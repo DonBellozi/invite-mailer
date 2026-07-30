@@ -46,6 +46,10 @@ RUNTIME_DEFAULTS: dict[str, str] = {
     "indigo_sync_interval_minutes": "15",
     "allowed_domains": "",
     "validate_domain": "1",
+    "backup_enabled": "1",
+    "backup_hour": "2",
+    "backup_minute": "0",
+    "backup_retention": "14",
 }
 
 

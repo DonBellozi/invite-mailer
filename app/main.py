@@ -24,6 +24,7 @@ from .settings import load_settings
 from .runtime_settings import apply_runtime_settings, bootstrap_runtime_settings
 from .reminders import process_reminders
 from .technical_alerts import dispatch_technical_error_digest
+from .backup import create_backup, enforce_retention
 
 
 logging.basicConfig(
@@ -176,6 +177,35 @@ def scheduler_mode(settings, db: Database) -> None:
         except Exception:
             LOGGER.exception("Ошибка автоматической отправки напоминаний")
 
+    def backup_job():
+        try:
+            local_now = datetime.now(ZoneInfo(timezone))
+            today = local_now.date().isoformat()
+            with db.connect() as connection:
+                values = {row["key"]: row["value"] for row in connection.execute(
+                    "SELECT key,value FROM app_settings WHERE key IN "
+                    "('backup_enabled','backup_hour','backup_minute','backup_retention','backup_last_auto_run')"
+                ).fetchall()}
+            if values.get("backup_enabled", "1") != "1":
+                return
+            hour = int(values.get("backup_hour", "2"))
+            minute = int(values.get("backup_minute", "0"))
+            if (local_now.hour, local_now.minute) < (hour, minute):
+                return
+            if values.get("backup_last_auto_run") == today:
+                return
+            result = create_backup(db, trigger="automatic")
+            removed = enforce_retention(max(1, int(values.get("backup_retention", "14"))))
+            with db.connect() as connection:
+                connection.execute(
+                    "INSERT INTO app_settings(key,value,updated_at) VALUES('backup_last_auto_run',?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    (today, local_now.isoformat()),
+                )
+            LOGGER.info("Резервная копия создана: %s; удалено по сроку хранения: %s", result["name"], removed)
+        except Exception:
+            LOGGER.exception("Ошибка автоматического резервного копирования")
+
     def indigo_job():
         if not _indigo_sync_due(db):
             return
@@ -239,6 +269,15 @@ def scheduler_mode(settings, db: Database) -> None:
         reminder_job,
         CronTrigger(minute="*", timezone=timezone),
         id="automatic_reminders",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    scheduler.add_job(
+        backup_job,
+        CronTrigger(minute="*", timezone=timezone),
+        id="automatic_backup",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

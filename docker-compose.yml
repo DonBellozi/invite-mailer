@@ -19,9 +19,8 @@ x-app-environment: &app-environment
   SMTP_FROM_NAME: "${SMTP_FROM_NAME}"
 
   WORKER_HASH_SECRET: "${WORKER_HASH_SECRET}"
+  BACKUP_PATH: "/backups"
 
-  # Все параметры PostgreSQL Indigo задаются только во внешнем окружении:
-  # в .env при обычном Docker Compose или в Environment variables стека Portainer.
   INDIGO_ENABLED: "${INDIGO_ENABLED}"
   INDIGO_DB_HOST: "${INDIGO_DB_HOST}"
   INDIGO_DB_PORT: "${INDIGO_DB_PORT}"
@@ -42,6 +41,7 @@ x-app-volumes: &app-volumes
   - "${STORAGE_ROOT}/data:/opt/invite-mailer/data"
   - "${STORAGE_ROOT}/state:/opt/invite-mailer/state"
   - "${STORAGE_ROOT}/reports:/opt/invite-mailer/reports"
+  - "${BACKUP_ROOT:-/opt/invite-mailer-backups}:/backups"
 
 services:
   invite-mailer:

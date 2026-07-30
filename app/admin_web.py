@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from openpyxl import Workbook
 from starlette.middleware.sessions import SessionMiddleware
@@ -37,6 +37,7 @@ from .mailer import send_html_email
 from .test_catalog import ensure_test_definitions, load_test_definitions
 from .indigo import refresh_indigo_test_catalog, get_indigo_test_catalog
 from .imap_source import fetch_latest_attachment
+from .backup import create_backup, enforce_retention, list_backups, resolve_backup, verify_backup
 
 from .report_export import (
     PDF_MEDIA_TYPE,
@@ -285,6 +286,15 @@ class ImapSettingsRequest(BaseModel):
     timezone: str = "Europe/Moscow"
 
 
+
+
+class BackupSettingsRequest(BaseModel):
+    enabled: bool = True
+    hour: int = 2
+    minute: int = 0
+    retention: int = 14
+
+
 class SmtpSettingsRequest(BaseModel):
     host: str
     port: int
@@ -431,6 +441,11 @@ def general_settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return GENERAL_SETTINGS_HTML
 
 
+@app.get("/admin/settings/backups/", response_class=HTMLResponse)
+def backups_page(_: Annotated[str, Depends(require_admin)]) -> str:
+    return BACKUPS_HTML
+
+
 @app.get("/admin/settings/reviewers/", response_class=HTMLResponse)
 def reviewers_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return REVIEWERS_HTML
@@ -512,6 +527,71 @@ def write_reminder_settings(
     _write_setting("reminder_run_day_of_week", str(request.run_day_of_week))
     return read_reminder_settings(_)
 
+
+
+@app.get("/api/settings/backups")
+def read_backup_settings(_: Annotated[str, Depends(require_admin)]):
+    return {
+        "enabled": _read_setting("backup_enabled", "1") == "1",
+        "hour": int(_read_setting("backup_hour", "2")),
+        "minute": int(_read_setting("backup_minute", "0")),
+        "retention": int(_read_setting("backup_retention", "14")),
+        "last_auto_run": _read_setting("backup_last_auto_run", ""),
+    }
+
+
+@app.put("/api/settings/backups")
+def write_backup_settings(request: BackupSettingsRequest, _: Annotated[str, Depends(require_admin)]):
+    if request.hour < 0 or request.hour > 23 or request.minute < 0 or request.minute > 59:
+        raise HTTPException(status_code=400, detail="Некорректное время резервного копирования")
+    if request.retention < 1 or request.retention > 365:
+        raise HTTPException(status_code=400, detail="Количество копий должно быть от 1 до 365")
+    _write_setting("backup_enabled", "1" if request.enabled else "0")
+    _write_setting("backup_hour", str(request.hour))
+    _write_setting("backup_minute", str(request.minute))
+    _write_setting("backup_retention", str(request.retention))
+    enforce_retention(request.retention)
+    return read_backup_settings(_)
+
+
+@app.get("/api/backups")
+def api_list_backups(_: Annotated[str, Depends(require_admin)]):
+    return {"items": list_backups()}
+
+
+@app.post("/api/backups")
+def api_create_backup(_: Annotated[str, Depends(require_admin)]):
+    result = create_backup(database(), trigger="manual")
+    enforce_retention(int(_read_setting("backup_retention", "14")))
+    return result
+
+
+@app.get("/api/backups/{name}/download")
+def api_download_backup(name: str, _: Annotated[str, Depends(require_admin)]):
+    try:
+        path = resolve_backup(name)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="Резервная копия не найдена")
+    return FileResponse(path, media_type="application/zip", filename=path.name)
+
+
+@app.post("/api/backups/{name}/verify")
+def api_verify_backup(name: str, _: Annotated[str, Depends(require_admin)]):
+    try:
+        path = resolve_backup(name)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="Резервная копия не найдена")
+    return verify_backup(path)
+
+
+@app.delete("/api/backups/{name}")
+def api_delete_backup(name: str, _: Annotated[str, Depends(require_admin)]):
+    try:
+        path = resolve_backup(name)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="Резервная копия не найдена")
+    path.unlink()
+    return {"status": "deleted"}
 
 
 def _imap_payload() -> dict:
@@ -1529,7 +1609,7 @@ TEMPLATE_VARIABLES_HTML = r"""<!doctype html><html lang="ru"><head><meta charset
 {% endfor %}</pre></div><div class="card"><h2>Технические уведомления</h2><p>Доступны <code>errors</code>, <code>errors_count</code>, <code>fio</code>, <code>email</code>, <code>error_type</code>, <code>error_text</code> и другие поля, передаваемые конкретным событием. Для проверки используйте кнопку отправки тестового письма.</p></div></body></html>"""
 
 
-SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card,.item{background:#fff;border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.card{margin-bottom:18px}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px}.link{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.link:hover{background:#f2f4f7}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 8px;font-size:18px}.small,p{color:#667085;font-size:13px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:18px}.item{display:flex;flex-direction:column;min-height:150px;border:1px solid #e1e5ea}.item .link{margin-top:auto;align-self:flex-start;background:#175cd3;color:#fff;border-color:#175cd3}@media(max-width:800px){.grid{grid-template-columns:1fr}.header{flex-direction:column}}</style></head><body><div class="card"><div class="header"><div><h1>Настройки</h1><div class="small">Управление рассылкой, контролирующими и журналом уведомлений.</div></div><div class="actions"><a class="link" href="/admin/">Импорт участников</a><a class="link" href="/">Отчет</a></div></div></div><div class="grid"><section class="item"><h2>Общие настройки</h2><p>Интервал и максимальное количество напоминаний, уведомление контролирующих и срок хранения журнала.</p><a class="link" href="/admin/settings/general/">Открыть</a></section><section class="item"><h2>Контролирующие</h2><p>Назначение контролирующих по тестам и получение технических ошибок.</p><a class="link" href="/admin/settings/reviewers/">Открыть</a></section><section class="item"><h2>Журнал уведомлений</h2><p>Просмотр событий рассылки, уведомлений контролирующим и технических ошибок.</p><a class="link" href="/admin/journal/">Открыть</a></section><section class="item"><h2>Сопоставление логинов</h2><p>Ручное сопоставление e-mail работников с логинами Indigo.</p><a class="link" href="/admin/logins/">Открыть</a></section><section class="item"><h2>Тесты и письма</h2><p>Добавление и изменение тестов, выбор теста Indigo, участники, приглашение и напоминание.</p><a class="link" href="/admin/settings/tests/">Открыть</a></section><section class="item"><h2>Системные шаблоны</h2><p>Уведомления контролирующим и технические сообщения.</p><a class="link" href="/admin/settings/templates/">Открыть</a></section></div></body></html>"""
+SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card,.item{background:#fff;border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.card{margin-bottom:18px}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px}.link{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.link:hover{background:#f2f4f7}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 8px;font-size:18px}.small,p{color:#667085;font-size:13px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:18px}.item{display:flex;flex-direction:column;min-height:150px;border:1px solid #e1e5ea}.item .link{margin-top:auto;align-self:flex-start;background:#175cd3;color:#fff;border-color:#175cd3}@media(max-width:800px){.grid{grid-template-columns:1fr}.header{flex-direction:column}}</style></head><body><div class="card"><div class="header"><div><h1>Настройки</h1><div class="small">Управление рассылкой, контролирующими и журналом уведомлений.</div></div><div class="actions"><a class="link" href="/admin/">Импорт участников</a><a class="link" href="/">Отчет</a></div></div></div><div class="grid"><section class="item"><h2>Общие настройки</h2><p>Интервал и максимальное количество напоминаний, уведомление контролирующих и срок хранения журнала.</p><a class="link" href="/admin/settings/general/">Открыть</a></section><section class="item"><h2>Контролирующие</h2><p>Назначение контролирующих по тестам и получение технических ошибок.</p><a class="link" href="/admin/settings/reviewers/">Открыть</a></section><section class="item"><h2>Журнал уведомлений</h2><p>Просмотр событий рассылки, уведомлений контролирующим и технических ошибок.</p><a class="link" href="/admin/journal/">Открыть</a></section><section class="item"><h2>Сопоставление логинов</h2><p>Ручное сопоставление e-mail работников с логинами Indigo.</p><a class="link" href="/admin/logins/">Открыть</a></section><section class="item"><h2>Тесты и письма</h2><p>Добавление и изменение тестов, выбор теста Indigo, участники, приглашение и напоминание.</p><a class="link" href="/admin/settings/tests/">Открыть</a></section><section class="item"><h2>Системные шаблоны</h2><p>Уведомления контролирующим и технические сообщения.</p><a class="link" href="/admin/settings/templates/">Открыть</a></section><section class="item"><h2>Резервное копирование</h2><p>Автоматические и ручные копии базы данных и конфигурации.</p><a class="link" href="/admin/settings/backups/">Открыть</a></section></div></body></html>"""
 
 
 TEMPLATES_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Системные шаблоны</title><style>
@@ -1545,6 +1625,9 @@ body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.car
 let tests=[],catalog=[],current=null,creating=false;const $=id=>document.getElementById(id),esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));async function api(u,o={}){const r=await fetch(u,o);let p={};try{p=await r.json()}catch(_){p={}}if(!r.ok)throw new Error(typeof p.detail==='string'?p.detail:`HTTP ${r.status}`);return p}function msg(t,k){$('message').textContent=t;$('message').className=`message ${k}`}const lines=v=>String(v||'').split(/\r?\n|,/).map(x=>x.trim()).filter(Boolean);function renderList(){$('testList').innerHTML=tests.map(t=>`<button data-id="${esc(t.id)}" class="${current===t.id?'active':''}"><strong>${esc(t.name)}</strong><br><span class="small">${esc(t.id)} · ${t.enabled?'активен':'отключен'}</span></button>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>openTest(b.dataset.id))}function renderCatalog(selectedId,selectedName){$('indigoSelect').innerHTML='<option value="">Не выбран</option>'+catalog.map((x,i)=>`<option value="${i}" ${String(x.logical_test_id)===String(selectedId)&&x.test_name===selectedName?'selected':''}>${esc(x.test_name)} · ID ${x.logical_test_id} (${x.source_rows})</option>`).join('');if(selectedId&&!catalog.some(x=>String(x.logical_test_id)===String(selectedId)&&x.test_name===selectedName))$('indigoSelect').insertAdjacentHTML('beforeend',`<option selected value="legacy">${esc(selectedName||'Тест')} · ID ${esc(selectedId)} (из настроек)</option>`)}$('indigoSelect').onchange=()=>{const i=$('indigoSelect').value;if(i===''||i==='legacy')return;const x=catalog[Number(i)];$('logical').value=x.logical_test_id;$('indigoName').value=x.test_name};function testPayload(){return {id:$('id').value.trim(),enabled:$('enabled').checked,name:$('name').value.trim(),mode:$('mode').value,validity_days:$('validity').value?Number($('validity').value):null,audience_type:$('audience').value,departments_include:lines($('include').value),departments_exclude:lines($('exclude').value),indigo_logical_test_id:$('logical').value?Number($('logical').value):null,indigo_test_name:$('indigoName').value.trim(),indigo_success_results:lines($('success').value),indigo_failed_prefixes:lines($('failed').value)}}function mail(prefix){return {subject:$(prefix+'Subject').value,body_html:$(prefix+'Body').value,enabled:$(prefix+'Enabled').checked}}function fill(b){const t=b.test,ind=t.indigo||{};current=t.id;creating=false;$('editor').hidden=false;$('formTitle').textContent=`Изменить тест «${t.name}»`;$('id').value=t.id;$('id').readOnly=true;$('name').value=t.name;$('enabled').checked=!!t.enabled;$('mode').value=t.mode||'once';$('validity').value=t.validity_days??'';$('audience').value=t.audience?'explicit_list':'all';$('include').value=(t.departments?.include||['*']).join('\n');$('exclude').value=(t.departments?.exclude||[]).join('\n');$('logical').value=ind.logical_test_id||'';$('indigoName').value=ind.test_name||'';$('success').value=(ind.success_results||[]).join('\n');$('failed').value=(ind.failed_result_prefixes||[]).join('\n');renderCatalog(ind.logical_test_id,ind.test_name);for(const [p,x] of [['inv',b.invitation],['rem',b.reminder]]){$(p+'Enabled').checked=!!x?.enabled;$(p+'Subject').value=x?.subject||'';$(p+'Body').value=x?.body_html||''}renderList();scrollTo(0,0)}async function openTest(id){const b=await api(`/api/settings/tests/${encodeURIComponent(id)}/bundle`);fill(b)}function addNew(){creating=true;current=null;$('editor').hidden=false;$('formTitle').textContent='Добавить тест';['id','name','validity','include','exclude','logical','indigoName','success','failed','invSubject','invBody','remSubject','remBody'].forEach(x=>$(x).value='');$('id').readOnly=false;$('enabled').checked=true;$('mode').value='once';$('audience').value='all';$('include').value='*';$('success').value='Отлично\nХорошо';$('failed').value='Требуется повторный';$('invEnabled').checked=true;$('remEnabled').checked=true;renderCatalog();renderList()}async function loadCatalog(force=false){const p=await api(force?'/api/settings/indigo-tests/refresh':'/api/settings/indigo-tests',{method:force?'POST':'GET'});catalog=p.items||[];$('catalogStatus').textContent=p.refreshed_at?`Кеш Indigo: ${new Date(p.refreshed_at).toLocaleString('ru-RU')}${p.error?' · ошибка обновления: '+p.error:''}`:(p.error||'Кеш Indigo пока пуст');if(!$('editor').hidden)renderCatalog($('logical').value,$('indigoName').value)}async function load(){tests=(await api('/api/settings/tests')).items;renderList();await loadCatalog(false)}$('add').onclick=addNew;$('refreshCatalog').onclick=()=>loadCatalog(true).then(()=>msg('Список тестов Indigo обновлен.','success')).catch(e=>msg(e.message,'error'));$('save').onclick=async()=>{try{const t=testPayload();if(creating){const r=await api('/api/settings/tests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(t)});await api(`/api/settings/templates/invitation/${encodeURIComponent(r.id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(mail('inv'))});await api(`/api/settings/templates/reminder/${encodeURIComponent(r.id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(mail('rem'))});current=r.id}else await api(`/api/settings/tests/${encodeURIComponent(current)}/bundle`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({test:t,invitation:mail('inv'),reminder:mail('rem')})});tests=(await api('/api/settings/tests')).items;msg('Настройки теста и письма сохранены.','success');await openTest(current)}catch(e){msg(e.message,'error')}};$('remove').onclick=async()=>{if(!current||!confirm('Удалить тест? Используемый тест будет отключен.'))return;const r=await api(`/api/settings/tests/${encodeURIComponent(current)}`,{method:'DELETE'});msg(r.detail||'Готово.','success');$('editor').hidden=true;current=null;tests=(await api('/api/settings/tests')).items;renderList()};$('cancel').onclick=()=>{$('editor').hidden=true;current=null;renderList()};async function sendTest(kind,prefix){try{await api('/api/settings/templates/test-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient:$(prefix+'Email').value.trim(),kind,template_id:current||$('id').value.trim(),...mail(prefix)})});msg('Тестовое письмо отправлено.','success')}catch(e){msg(e.message,'error')}}$('invTest').onclick=()=>sendTest('invitation','inv');$('remTest').onclick=()=>sendTest('reminder','rem');load().catch(e=>msg(e.message,'error'));
 </script></body></html>"""
 
+
+
+BACKUPS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Резервное копирование</title><style>body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}h1,h2{margin-top:0}.row{display:flex;gap:14px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:5px}.field input{padding:9px;border:1px solid #cfd4dc;border-radius:7px}.button,.link{display:inline-block;padding:9px 13px;border:0;border-radius:7px;background:#175cd3;color:#fff;text-decoration:none;font-weight:600;cursor:pointer}.secondary{background:#fff;color:#344054;border:1px solid #98a2b3}.danger{background:#b42318}.small{color:#667085;font-size:13px}.table{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px;border-bottom:1px solid #e1e5ea;text-align:left;vertical-align:top}.status{margin-top:12px;white-space:pre-wrap}</style></head><body><div class="card"><h1>Резервное копирование</h1><p class="small">Копии сохраняются в подключенном каталоге <code>/backups</code>. В архив входят безопасный снимок SQLite, конфигурация и рабочие данные приложения.</p><a class="link secondary" href="/admin/settings/">К настройкам</a></div><div class="card"><h2>Автоматическое создание</h2><div class="row"><label><input id="enabled" type="checkbox"> Включено</label><div class="field"><label>Час</label><input id="hour" type="number" min="0" max="23"></div><div class="field"><label>Минута</label><input id="minute" type="number" min="0" max="59"></div><div class="field"><label>Хранить успешных копий</label><input id="retention" type="number" min="1" max="365"></div><button class="button" onclick="saveSettings()">Сохранить</button></div><div id="settingsStatus" class="status small"></div></div><div class="card"><h2>Резервные копии</h2><button class="button" onclick="createBackup()">Создать копию</button> <button class="button secondary" onclick="loadBackups()">Обновить список</button><div id="actionStatus" class="status small"></div><div class="table"><table><thead><tr><th>Создана</th><th>Тип</th><th>Размер</th><th>Версия</th><th>SHA-256</th><th>Действия</th></tr></thead><tbody id="items"></tbody></table></div></div><script>function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function size(v){if(v<1024)return v+' Б';if(v<1048576)return (v/1024).toFixed(1)+' КБ';return (v/1048576).toFixed(1)+' МБ'}async function json(url,opt){const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'Ошибка запроса');return d}async function loadSettings(){const d=await json('/api/settings/backups');enabled.checked=d.enabled;hour.value=d.hour;minute.value=d.minute;retention.value=d.retention;settingsStatus.textContent=d.last_auto_run?'Последний автоматический запуск: '+d.last_auto_run:''}async function saveSettings(){try{const d=await json('/api/settings/backups',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled.checked,hour:+hour.value,minute:+minute.value,retention:+retention.value})});settingsStatus.textContent='Настройки сохранены';await loadBackups()}catch(e){settingsStatus.textContent=e.message}}async function loadBackups(){try{const d=await json('/api/backups');items.innerHTML=d.items.map(x=>`<tr><td>${esc(x.created_at||x.modified_at)}</td><td>${esc(x.trigger||'–')}</td><td>${size(x.size)}</td><td>${esc(x.application_version||'–')}</td><td title="${esc(x.sha256)}">${esc((x.sha256||'').slice(0,16))}…</td><td><a class="link secondary" href="/api/backups/${encodeURIComponent(x.name)}/download">Скачать</a> <button class="button secondary" onclick="verifyBackup('${esc(x.name)}')">Проверить</button> <button class="button danger" onclick="deleteBackup('${esc(x.name)}')">Удалить</button></td></tr>`).join('')||'<tr><td colspan="6">Копий пока нет</td></tr>'}catch(e){actionStatus.textContent=e.message}}async function createBackup(){actionStatus.textContent='Создание копии...';try{const d=await json('/api/backups',{method:'POST'});actionStatus.textContent='Создана '+d.name;await loadBackups()}catch(e){actionStatus.textContent=e.message}}async function verifyBackup(n){actionStatus.textContent='Проверка...';try{const d=await json('/api/backups/'+encodeURIComponent(n)+'/verify',{method:'POST'});actionStatus.textContent=d.valid?'Архив исправен. Проверено файлов: '+d.checked_files:'Ошибки: '+d.errors.join('; ')}catch(e){actionStatus.textContent=e.message}}async function deleteBackup(n){if(!confirm('Удалить резервную копию '+n+'?'))return;try{await json('/api/backups/'+encodeURIComponent(n),{method:'DELETE'});actionStatus.textContent='Копия удалена';await loadBackups()}catch(e){actionStatus.textContent=e.message}}loadSettings();loadBackups();</script></body></html>"""
 
 GENERAL_SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Общие настройки</title><style>
 body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px}.link,button{display:inline-flex;align-items:center;justify-content:center;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff;cursor:pointer}.link:hover,button:hover{background:#f2f4f7}.actions .link{width:100%}h2{margin-top:0}.small,.hint{color:#667085;font-size:12px;line-height:1.45}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.row{display:grid;grid-template-columns:minmax(220px,1fr) minmax(220px,320px);gap:16px;align-items:center;padding:11px 0;border-bottom:1px solid #eaecf0}label{font-weight:600}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px;background:#fff}input[type=checkbox]{width:20px;height:20px}.buttons{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.message{display:none;margin-top:14px;padding:12px;border-radius:7px}.success{display:block;background:#ecfdf3;color:#05603a}.error{display:block;background:#fef3f2;color:#912018}.status{padding:8px 10px;border-radius:6px;background:#f2f4f7;font-size:12px;margin-bottom:12px}.wide{grid-column:1/-1}@media(max-width:900px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}@media(max-width:720px){.header{flex-direction:column}.row{grid-template-columns:1fr}}
