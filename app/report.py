@@ -436,10 +436,10 @@ def _mail_queue_state(
     escalation,
     now: datetime,
 ) -> tuple[bool, str, str]:
-    """Возвращает фактическое наличие письма в ближайшей очереди.
+    """Показывает, предусмотрена ли для работника следующая отправка.
 
-    Очередь не подменяет основной статус работника. Она используется только
-    фильтром «Ожидает отправки» и поясняющими столбцами отчета.
+    Фильтр включает как письма, готовые к ближайшему запуску, так и будущие
+    напоминания, которые будут отправлены, если тест не будет успешно пройден.
     """
     if not employee["active"] or not employee["email"]:
         return False, "", ""
@@ -492,8 +492,6 @@ def _mail_queue_state(
     if anchor_dt is None:
         return False, "", ""
     due_at = anchor_dt + timedelta(days=interval_days)
-    if now < due_at:
-        return False, "", ""
 
     reminder_number = reminder_count + 1
     retry = bool(
@@ -531,14 +529,14 @@ def _department_applies(
     return included and not excluded
 
 
-def _method_label(method: str | None) -> str:
-    if method == "manual_seed":
-        return "вручную"
+def _method_label(method: str | None, reminder_count: int = 0) -> str:
+    if method != "reminder":
+        return ""
 
-    if method == "automatic":
-        return "автоматически"
+    if reminder_count <= 1:
+        return "напоминание"
 
-    return method or ""
+    return f"напоминание № {reminder_count}"
 
 
 def _row_status(
@@ -546,6 +544,7 @@ def _row_status(
     latest,
     result: ResultSummary,
     escalation=None,
+    reminder_count: int = 0,
 ) -> tuple[str, str, str]:
     if not employee["active"]:
         return (
@@ -614,7 +613,7 @@ def _row_status(
             )
 
         if raw_status == "sent":
-            method = _method_label(latest["method"])
+            method = _method_label(latest["method"], reminder_count)
             suffix = f" – {method}" if method else ""
 
             return (
@@ -820,6 +819,23 @@ def build_report(
                     (employee["worker_key"], employee["employment_seq"], template["id"]),
                 ).fetchone()
 
+                reminder_count = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM notification_history
+                    WHERE worker_key = ?
+                      AND employment_seq = ?
+                      AND template_id = ?
+                      AND status = 'sent'
+                      AND method = 'reminder'
+                    """,
+                    (
+                        employee["worker_key"],
+                        employee["employment_seq"],
+                        template["id"],
+                    ),
+                ).fetchone()["count"]
+
                 (
                     status,
                     status_class,
@@ -829,12 +845,13 @@ def build_report(
                     latest,
                     result,
                     escalation,
+                    int(reminder_count or 0),
                 )
 
                 (
                     queued,
-                    queue_action,
-                    queue_date,
+                    _queue_action,
+                    _queue_date,
                 ) = _mail_queue_state(
                     connection,
                     employee,
@@ -902,8 +919,6 @@ def build_report(
                     f"<td class='{status_class}'>"
                     f"{html.escape(status)}"
                     f"</td>"
-                    f"<td>{html.escape(queue_action)}</td>"
-                    f"<td>{html.escape(queue_date)}</td>"
                     f"<td>{html.escape(grade)}</td>"
                     f"<td>{html.escape(percent)}</td>"
                     f"</tr>"
@@ -1171,8 +1186,6 @@ def build_report(
           <th>Должность</th>
           <th>Тест</th>
           <th>Статус</th>
-          <th>Предстоящая отправка</th>
-          <th>Плановая дата</th>
           <th>Оценка</th>
           <th>Результат, %</th>
         </tr>
