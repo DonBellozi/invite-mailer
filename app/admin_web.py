@@ -9,6 +9,8 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
+from ldap3 import ALL, SUBTREE, Connection, Server, Tls
+from ldap3.core.exceptions import LDAPException
 from openpyxl import Workbook
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -140,6 +142,17 @@ def _ensure_v202_schema(db: Database) -> None:
             "reminder_run_day_of_week": "6",
             "indigo_sync_interval_minutes": "15",
             "public_report_enabled": "1",
+            "ad_enabled": "0",
+            "ad_server": "",
+            "ad_port": "389",
+            "ad_use_ssl": "0",
+            "ad_domain": "",
+            "ad_base_dn": "",
+            "ad_bind_user": "",
+            "ad_bind_password": "",
+            "ad_user_filter": "(sAMAccountName={login})",
+            "ad_domain_admins_enabled": "0",
+            "ad_domain_admins_group": "Domain Admins",
         }
         now = _utc_now()
         for key, value in defaults.items():
@@ -280,10 +293,11 @@ def _permissions(request: Request) -> dict:
             "can_view_report": False, "can_import": False, "is_admin": False,
             "enabled": False, "emergency_admin": False,
         }
+    session_domain_admin = bool(request.session.get("ad_domain_admin", False))
     emergency = bool(_emergency_admin_login()) and secrets.compare_digest(
         username.casefold(), _emergency_admin_login().casefold()
     )
-    if emergency:
+    if emergency or session_domain_admin:
         return {
             "authenticated": True, "username": username,
             "display_name": str(request.session.get("display_name", "")).strip() or _display_name(username),
@@ -365,6 +379,24 @@ class UserAccessRequest(BaseModel):
 
 class PublicAccessRequest(BaseModel):
     enabled: bool = True
+
+
+class AdSettingsRequest(BaseModel):
+    enabled: bool = False
+    server: str = ""
+    port: int = 389
+    use_ssl: bool = False
+    domain: str = ""
+    base_dn: str = ""
+    bind_user: str = ""
+    bind_password: str = ""
+    user_filter: str = "(sAMAccountName={login})"
+    domain_admins_enabled: bool = False
+    domain_admins_group: str = "Domain Admins"
+
+
+class AdLookupRequest(BaseModel):
+    login: str
 
 
 class ConfirmRequest(BaseModel):
@@ -493,7 +525,86 @@ def find_report_template(
     )
 
 
-LOGIN_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход</title><style>body{font-family:Arial,sans-serif;margin:0;background:#f5f6f8;color:#222;min-height:100vh;display:grid;place-items:center}.card{width:min(420px,calc(100% - 32px));background:#fff;border-radius:12px;padding:24px;box-sizing:border-box;box-shadow:0 2px 12px rgba(0,0,0,.12)}h1{margin:0 0 8px;font-size:24px}.small{margin:0 0 20px;color:#667085;font-size:13px;line-height:1.45}label{display:block;margin:14px 0 6px;font-size:13px;font-weight:600}input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #98a2b3;border-radius:7px;font-size:14px}.button{width:100%;margin-top:18px;padding:10px 14px;border:1px solid #175cd3;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.error{margin-top:14px;padding:10px 12px;border-radius:7px;background:#fef3f2;color:#b42318;font-size:13px}.back{display:block;margin-top:14px;text-align:center;color:#475467;text-decoration:none;font-size:13px}</style></head><body><main class="card"><h1>Вход</h1><p class="small">Используйте встроенную учетную запись Invite Mailer.</p><form method="post" action="/login"><input type="hidden" name="next" value="__NEXT__"><label for="username">Логин</label><input id="username" name="username" autocomplete="username" required autofocus><label for="password">Пароль</label><input id="password" name="password" type="password" autocomplete="current-password" required><button class="button" type="submit">Войти</button></form>__ERROR__<a class="back" href="/">Вернуться к отчету</a></main></body></html>"""
+
+def _ad_bool(key: str, default: str = "0") -> bool:
+    return _read_setting(key, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ad_bind_name(login: str) -> str:
+    login = login.strip()
+    domain = _read_setting("ad_domain", "").strip()
+    if "\\" in login or "@" in login or not domain:
+        return login
+    return f"{domain}\\{login}"
+
+
+def _ad_server() -> Server:
+    host = _read_setting("ad_server", "").strip()
+    if not host:
+        raise RuntimeError("Не указан сервер Active Directory")
+    return Server(host, port=int(_read_setting("ad_port", "389")), use_ssl=_ad_bool("ad_use_ssl"), get_info=ALL)
+
+
+def _ad_search_connection() -> Connection:
+    bind_user = _read_setting("ad_bind_user", "").strip()
+    bind_password = _read_setting("ad_bind_password", "")
+    if not bind_user or not bind_password:
+        raise RuntimeError("Для поиска пользователей укажите служебную учетную запись Active Directory")
+    connection = Connection(_ad_server(), user=_ad_bind_name(bind_user), password=bind_password, auto_bind=True, raise_exceptions=True)
+    return connection
+
+
+def _ad_find_user(login: str, connection: Connection | None = None) -> dict:
+    clean_login = login.strip().split("\\")[-1].split("@")[0]
+    if not clean_login:
+        raise RuntimeError("Не указан логин Active Directory")
+    base_dn = _read_setting("ad_base_dn", "").strip()
+    if not base_dn:
+        raise RuntimeError("Не указан Base DN Active Directory")
+    template = _read_setting("ad_user_filter", "(sAMAccountName={login})") or "(sAMAccountName={login})"
+    escaped = clean_login.replace("\\", r"\5c").replace("*", r"\2a").replace("(", r"\28").replace(")", r"\29").replace("\x00", r"\00")
+    search_filter = template.replace("{login}", escaped)
+    own = connection is None
+    conn = connection or _ad_search_connection()
+    try:
+        ok = conn.search(base_dn, search_filter, search_scope=SUBTREE, attributes=["sAMAccountName", "displayName", "mail", "department", "memberOf", "distinguishedName"])
+        if not ok or not conn.entries:
+            raise RuntimeError("Пользователь не найден в Active Directory")
+        entry = conn.entries[0]
+        values = entry.entry_attributes_as_dict
+        groups = [str(x) for x in values.get("memberOf", [])]
+        return {
+            "login": str((values.get("sAMAccountName") or [clean_login])[0]),
+            "display_name": str((values.get("displayName") or [clean_login])[0]),
+            "email": str((values.get("mail") or [""])[0]),
+            "department": str((values.get("department") or [""])[0]),
+            "groups": groups,
+        }
+    finally:
+        if own:
+            conn.unbind()
+
+
+def _ad_authenticate(login: str, password: str) -> dict:
+    if not _ad_bool("ad_enabled"):
+        raise RuntimeError("Авторизация через Active Directory отключена")
+    if not password:
+        raise RuntimeError("Не указан пароль")
+    conn = Connection(_ad_server(), user=_ad_bind_name(login), password=password, auto_bind=True, raise_exceptions=True)
+    try:
+        return _ad_find_user(login, conn)
+    finally:
+        conn.unbind()
+
+
+def _ad_is_domain_admin(user: dict) -> bool:
+    if not _ad_bool("ad_domain_admins_enabled"):
+        return False
+    group = _read_setting("ad_domain_admins_group", "Domain Admins").strip().casefold()
+    return any((f"cn={group}," in value.casefold()) or value.casefold() == group for value in user.get("groups", []))
+
+
+LOGIN_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход</title><style>body{font-family:Arial,sans-serif;margin:0;background:#f5f6f8;color:#222;min-height:100vh;display:grid;place-items:center}.card{width:min(420px,calc(100% - 32px));background:#fff;border-radius:12px;padding:24px;box-sizing:border-box;box-shadow:0 2px 12px rgba(0,0,0,.12)}h1{margin:0 0 8px;font-size:24px}.small{margin:0 0 20px;color:#667085;font-size:13px;line-height:1.45}label{display:block;margin:14px 0 6px;font-size:13px;font-weight:600}input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #98a2b3;border-radius:7px;font-size:14px}.button{width:100%;margin-top:18px;padding:10px 14px;border:1px solid #175cd3;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.error{margin-top:14px;padding:10px 12px;border-radius:7px;background:#fef3f2;color:#b42318;font-size:13px}.back{display:block;margin-top:14px;text-align:center;color:#475467;text-decoration:none;font-size:13px}</style></head><body><main class="card"><h1>Вход</h1><p class="small">Используйте доменную учетную запись. Аварийная учетная запись администратора из .env также доступна.</p><form method="post" action="/login"><input type="hidden" name="next" value="__NEXT__"><label for="username">Логин</label><input id="username" name="username" autocomplete="username" required autofocus><label for="password">Пароль</label><input id="password" name="password" type="password" autocomplete="current-password" required><button class="button" type="submit">Войти</button></form>__ERROR__<a class="back" href="/">Вернуться к отчету</a></main></body></html>"""
 
 
 def _login_html(next_url: str, error: str = "") -> str:
@@ -511,18 +622,33 @@ def login_page(request: Request, next: str = "/"):
 
 @app.post("/login", response_class=HTMLResponse)
 def login_submit(request: Request, username: Annotated[str, Form()], password: Annotated[str, Form()], next: Annotated[str, Form()] = "/"):
+    clean_username = username.strip()
     expected_username = os.getenv("ADMIN_USERNAME", "").strip()
     expected_password = os.getenv("ADMIN_PASSWORD", "")
-    if not expected_username or not expected_password:
-        return HTMLResponse(_login_html(next, "Не заданы ADMIN_USERNAME и ADMIN_PASSWORD"), status_code=503)
-    username_ok = secrets.compare_digest(username.strip(), expected_username)
-    password_ok = secrets.compare_digest(password, expected_password)
-    if not username_ok or not password_ok:
-        return HTMLResponse(_login_html(next, "Неверный логин или пароль"), status_code=401)
-    request.session.clear()
-    request.session["username"] = expected_username
-    request.session["display_name"] = _display_name(expected_username)
-    return RedirectResponse(_safe_next(next), status_code=status.HTTP_303_SEE_OTHER)
+    emergency_ok = bool(expected_username and expected_password) and secrets.compare_digest(clean_username, expected_username) and secrets.compare_digest(password, expected_password)
+    try:
+        if emergency_ok:
+            display_name = _display_name(expected_username)
+            domain_admin = False
+            session_username = expected_username
+        else:
+            ad_user = _ad_authenticate(clean_username, password)
+            local = _user_record(ad_user["login"])
+            domain_admin = _ad_is_domain_admin(ad_user)
+            if not domain_admin and (not local or not bool(local["enabled"])):
+                return HTMLResponse(_login_html(next, "Учетной записи не предоставлен доступ"), status_code=403)
+            display_name = ad_user["display_name"]
+            session_username = ad_user["login"]
+            if local and display_name and display_name != local.get("display_name"):
+                with database().connect() as connection:
+                    connection.execute("UPDATE app_users SET display_name=?, updated_at=? WHERE id=?", (display_name, _utc_now(), local["id"]))
+        request.session.clear()
+        request.session["username"] = session_username
+        request.session["display_name"] = display_name
+        request.session["ad_domain_admin"] = domain_admin
+        return RedirectResponse(_safe_next(next), status_code=status.HTTP_303_SEE_OTHER)
+    except (LDAPException, RuntimeError, ValueError) as error:
+        return HTMLResponse(_login_html(next, f"Не удалось выполнить вход: {error}"), status_code=401)
 
 
 @app.get("/api/auth/me")
@@ -578,6 +704,11 @@ def general_settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
 @app.get("/admin/settings/users/", response_class=HTMLResponse)
 def users_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return USERS_HTML
+
+
+@app.get("/admin/settings/ad/", response_class=HTMLResponse)
+def ad_settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
+    return AD_SETTINGS_HTML
 
 
 @app.get("/admin/settings/backups/", response_class=HTMLResponse)
@@ -1076,6 +1207,57 @@ def get_public_report_setting(_: Annotated[str, Depends(require_admin)]):
 def set_public_report_setting(payload: PublicAccessRequest, _: Annotated[str, Depends(require_admin)]):
     _write_setting("public_report_enabled", "1" if payload.enabled else "0")
     return {"ok": True, "enabled": payload.enabled}
+
+
+@app.get("/api/settings/ad")
+def get_ad_settings(_: Annotated[str, Depends(require_admin)]):
+    return {
+        "enabled": _ad_bool("ad_enabled"), "server": _read_setting("ad_server", ""),
+        "port": int(_read_setting("ad_port", "389")), "use_ssl": _ad_bool("ad_use_ssl"),
+        "domain": _read_setting("ad_domain", ""), "base_dn": _read_setting("ad_base_dn", ""),
+        "bind_user": _read_setting("ad_bind_user", ""), "bind_password_set": bool(_read_setting("ad_bind_password", "")),
+        "user_filter": _read_setting("ad_user_filter", "(sAMAccountName={login})"),
+        "domain_admins_enabled": _ad_bool("ad_domain_admins_enabled"),
+        "domain_admins_group": _read_setting("ad_domain_admins_group", "Domain Admins"),
+    }
+
+
+@app.put("/api/settings/ad")
+def save_ad_settings(payload: AdSettingsRequest, _: Annotated[str, Depends(require_admin)]):
+    if payload.port < 1 or payload.port > 65535:
+        raise HTTPException(status_code=400, detail="Некорректный порт")
+    values = {
+        "ad_enabled": "1" if payload.enabled else "0", "ad_server": payload.server.strip(),
+        "ad_port": str(payload.port), "ad_use_ssl": "1" if payload.use_ssl else "0",
+        "ad_domain": payload.domain.strip(), "ad_base_dn": payload.base_dn.strip(),
+        "ad_bind_user": payload.bind_user.strip(),
+        "ad_user_filter": payload.user_filter.strip() or "(sAMAccountName={login})",
+        "ad_domain_admins_enabled": "1" if payload.domain_admins_enabled else "0",
+        "ad_domain_admins_group": payload.domain_admins_group.strip() or "Domain Admins",
+    }
+    for key, value in values.items():
+        _write_setting(key, value)
+    if payload.bind_password:
+        _write_setting("ad_bind_password", payload.bind_password)
+    return {"ok": True, "message": "Настройки Active Directory сохранены."}
+
+
+@app.post("/api/settings/ad/test")
+def test_ad_connection(_: Annotated[str, Depends(require_admin)]):
+    try:
+        conn = _ad_search_connection()
+        conn.unbind()
+        return {"ok": True, "message": "Подключение к Active Directory выполнено успешно."}
+    except (LDAPException, RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
+@app.post("/api/ad/lookup")
+def lookup_ad_user(payload: AdLookupRequest, _: Annotated[str, Depends(require_admin)]):
+    try:
+        return {"ok": True, "user": _ad_find_user(payload.login)}
+    except (LDAPException, RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=404, detail=str(error))
 
 
 @app.get("/api/users")
@@ -1869,9 +2051,9 @@ TEMPLATE_VARIABLES_HTML = r"""<!doctype html><html lang="ru"><head><meta charset
 
 
 
-USERS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Пользователи и права</title><style>body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px;padding-left:18px;border-left:2px solid #e5e7eb;box-sizing:border-box}.link,button{display:inline-flex;align-items:center;justify-content:center;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;background:#fff;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;cursor:pointer}.actions .link{width:100%}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.danger{color:#b42318;border-color:#f04438}.small{color:#667085;font-size:12px;line-height:1.45}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:14px}label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}input[type=text]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}.checks{display:grid;gap:10px;margin:14px 0}.check{display:flex;gap:10px;align-items:flex-start}.check input{width:20px;height:20px;margin:0}.buttons{display:flex;gap:10px;flex-wrap:wrap}.message{display:none;margin-top:12px;padding:11px;border-radius:7px}.success{display:block;background:#ecfdf3;color:#05603a}.error{display:block;background:#fef3f2;color:#912018}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px;border-bottom:1px solid #e1e5ea;text-align:left;vertical-align:middle}.badge{display:inline-block;padding:3px 7px;border-radius:999px;background:#eef2f7;font-size:12px}.disabled{opacity:.55}@media(max-width:800px){.header{flex-direction:column}.actions{min-width:100%;padding:16px 0 0;border-left:0;border-top:2px solid #e5e7eb}.grid{grid-template-columns:1fr}}</style></head><body><div class="card"><div class="header"><div><h1>Пользователи и права</h1><div class="small">Локальный список доменных логинов. Проверка пароля Active Directory будет подключена отдельным этапом. Встроенный администратор из .env всегда имеет полный доступ.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div><div class="card"><h2 id="form-title">Добавить пользователя</h2><input id="user-id" type="hidden"><div class="grid"><div class="field"><label for="login">Логин Active Directory</label><input id="login" type="text" autocomplete="off" placeholder="ivanov.ii"></div><div class="field"><label for="display-name">Отображаемое имя</label><input id="display-name" type="text" autocomplete="off" placeholder="Иванов Иван Иванович"></div></div><div class="checks"><label class="check"><input id="enabled" type="checkbox" checked><span><b>Учетная запись включена</b><div class="small">Отключенный пользователь не получает доступ даже при назначенных правах.</div></span></label><label class="check"><input id="basic" type="checkbox" checked><span><b>Базовый доступ</b><div class="small">Просмотр отчета, когда публичный просмотр отключен.</div></span></label><label class="check"><input id="import-right" type="checkbox"><span><b>Импорт сотрудников</b><div class="small">Включает базовый доступ автоматически.</div></span></label><label class="check"><input id="admin-right" type="checkbox"><span><b>Администратор</b><div class="small">Полный доступ ко всему функционалу и настройкам.</div></span></label></div><div class="buttons"><button id="save" class="primary">Сохранить</button><button id="cancel" type="button">Отмена</button></div><div id="message" class="message"></div></div><div class="card"><div class="table-wrap"><table><thead><tr><th>Логин</th><th>Имя</th><th>Статус</th><th>Базовый</th><th>Импорт</th><th>Администратор</th><th>Действия</th></tr></thead><tbody id="body"></tbody></table></div></div><script>let items=[];const q=id=>document.getElementById(id),esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));function syncRights(){if(q('admin-right').checked){q('import-right').checked=true;q('basic').checked=true}if(q('import-right').checked)q('basic').checked=true;q('import-right').disabled=q('admin-right').checked;q('basic').disabled=q('admin-right').checked||q('import-right').checked}q('admin-right').onchange=syncRights;q('import-right').onchange=syncRights;function reset(){q('user-id').value='';q('login').value='';q('display-name').value='';q('enabled').checked=true;q('basic').checked=true;q('import-right').checked=false;q('admin-right').checked=false;q('form-title').textContent='Добавить пользователя';syncRights()}function msg(t,k){q('message').textContent=t;q('message').className='message '+k}function render(){q('body').innerHTML=items.map(x=>`<tr class="${x.enabled?'':'disabled'}"><td>${esc(x.login)}</td><td>${esc(x.display_name)}</td><td><span class="badge">${x.enabled?'Включен':'Отключен'}</span></td><td>${x.can_view_report?'Да':'Нет'}</td><td>${x.can_import?'Да':'Нет'}</td><td>${x.is_admin?'Да':'Нет'}</td><td><div class="buttons"><button type="button" onclick="editUser(${x.id})">Изменить</button><button type="button" class="danger" onclick="removeUser(${x.id})">Удалить</button></div></td></tr>`).join('')}async function load(){const r=await fetch('/api/users'),p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка загрузки');items=p.items;render()}window.editUser=id=>{const x=items.find(v=>v.id===id);if(!x)return;q('user-id').value=x.id;q('login').value=x.login;q('display-name').value=x.display_name;q('enabled').checked=!!x.enabled;q('basic').checked=!!x.can_view_report;q('import-right').checked=!!x.can_import;q('admin-right').checked=!!x.is_admin;q('form-title').textContent='Изменить пользователя';syncRights();scrollTo({top:0,behavior:'smooth'})};window.removeUser=async id=>{if(!confirm('Удалить локальную запись пользователя?'))return;const r=await fetch('/api/users/'+id,{method:'DELETE'}),p=await r.json();if(!r.ok)return msg(p.detail||'Ошибка удаления','error');await load();msg('Пользователь удален.','success')};q('cancel').onclick=reset;q('save').onclick=async()=>{syncRights();const id=q('user-id').value,payload={login:q('login').value.trim(),display_name:q('display-name').value.trim(),enabled:q('enabled').checked,can_view_report:q('basic').checked,can_import:q('import-right').checked,is_admin:q('admin-right').checked};try{const r=await fetch(id?'/api/users/'+id:'/api/users',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка сохранения');reset();await load();msg('Пользователь сохранен.','success')}catch(e){msg(e.message,'error')}};syncRights();load().catch(e=>msg(e.message,'error'));</script></body></html>"""
+USERS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Пользователи и права</title><style>body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px;padding-left:18px;border-left:2px solid #e5e7eb;box-sizing:border-box}.link,button{display:inline-flex;align-items:center;justify-content:center;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;background:#fff;color:#344054;text-decoration:none;font-size:13px;font-weight:600;cursor:pointer}.actions .link{width:100%}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.danger{color:#b42318}.small{color:#667085;font-size:12px;line-height:1.45}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:14px}label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}input[type=text]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}.checks{display:grid;gap:10px;margin:14px 0}.check{display:flex;gap:10px}.check input{width:20px;height:20px}.buttons{display:flex;gap:10px;flex-wrap:wrap}.message{display:none;margin-top:12px;padding:11px;border-radius:7px}.success{display:block;background:#ecfdf3;color:#05603a}.error{display:block;background:#fef3f2;color:#912018}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px;border-bottom:1px solid #e1e5ea;text-align:left}.badge{padding:3px 7px;border-radius:999px;background:#eef2f7}.disabled{opacity:.55}@media(max-width:800px){.header{flex-direction:column}.actions{min-width:100%;padding:16px 0 0;border-left:0;border-top:2px solid #e5e7eb}.grid{grid-template-columns:1fr}}</style></head><body><div class="card"><div class="header"><div><h1>Пользователи и права</h1><div class="small">Введите доменный логин и нажмите «Найти в AD». Отображаемое имя заполняется из Active Directory. Пароли пользователей не сохраняются.</div></div><div class="actions"><a class="link" href="/admin/settings/ad/">Active Directory</a><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div><div class="card"><h2 id="form-title">Добавить пользователя</h2><input id="user-id" type="hidden"><div class="grid"><div class="field"><label>Логин Active Directory</label><input id="login" type="text" placeholder="ivanov.ii"><div class="buttons" style="margin-top:8px"><button id="lookup" type="button">Найти в AD</button></div></div><div class="field"><label>Отображаемое имя</label><input id="display-name" type="text" readonly placeholder="Будет получено из AD"></div></div><div class="checks"><label class="check"><input id="enabled" type="checkbox" checked><span><b>Учетная запись включена</b></span></label><label class="check"><input id="basic" type="checkbox" checked><span><b>Базовый доступ</b></span></label><label class="check"><input id="import-right" type="checkbox"><span><b>Импорт сотрудников</b></span></label><label class="check"><input id="admin-right" type="checkbox"><span><b>Администратор</b></span></label></div><div class="buttons"><button id="save" class="primary">Сохранить</button><button id="cancel" type="button">Отмена</button></div><div id="message" class="message"></div></div><div class="card"><div class="table-wrap"><table><thead><tr><th>Логин</th><th>Имя</th><th>Статус</th><th>Базовый</th><th>Импорт</th><th>Администратор</th><th>Действия</th></tr></thead><tbody id="body"></tbody></table></div></div><script>let items=[],verified=false;const q=id=>document.getElementById(id),esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));function syncRights(){if(q('admin-right').checked){q('import-right').checked=true;q('basic').checked=true}if(q('import-right').checked)q('basic').checked=true;q('import-right').disabled=q('admin-right').checked;q('basic').disabled=q('admin-right').checked||q('import-right').checked}q('admin-right').onchange=syncRights;q('import-right').onchange=syncRights;q('login').oninput=()=>{verified=false;q('display-name').value=''};function reset(){q('user-id').value='';q('login').value='';q('display-name').value='';verified=false;q('enabled').checked=true;q('basic').checked=true;q('import-right').checked=false;q('admin-right').checked=false;q('form-title').textContent='Добавить пользователя';syncRights()}function msg(t,k){q('message').textContent=t;q('message').className='message '+k}function render(){q('body').innerHTML=items.map(x=>`<tr class="${x.enabled?'':'disabled'}"><td>${esc(x.login)}</td><td>${esc(x.display_name)}</td><td><span class="badge">${x.enabled?'Включен':'Отключен'}</span></td><td>${x.can_view_report?'Да':'Нет'}</td><td>${x.can_import?'Да':'Нет'}</td><td>${x.is_admin?'Да':'Нет'}</td><td><div class="buttons"><button onclick="editUser(${x.id})">Изменить</button><button class="danger" onclick="removeUser(${x.id})">Удалить</button></div></td></tr>`).join('')}async function load(){const r=await fetch('/api/users'),p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка загрузки');items=p.items;render()}q('lookup').onclick=async()=>{try{const r=await fetch('/api/ad/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({login:q('login').value.trim()})}),p=await r.json();if(!r.ok)throw new Error(p.detail||'Пользователь не найден');q('login').value=p.user.login;q('display-name').value=p.user.display_name;verified=true;msg('Пользователь найден в Active Directory.','success')}catch(e){verified=false;msg(e.message,'error')}};window.editUser=id=>{const x=items.find(v=>v.id===id);if(!x)return;q('user-id').value=x.id;q('login').value=x.login;q('display-name').value=x.display_name;verified=true;q('enabled').checked=!!x.enabled;q('basic').checked=!!x.can_view_report;q('import-right').checked=!!x.can_import;q('admin-right').checked=!!x.is_admin;q('form-title').textContent='Изменить пользователя';syncRights();scrollTo({top:0,behavior:'smooth'})};window.removeUser=async id=>{if(!confirm('Удалить локальную запись пользователя?'))return;const r=await fetch('/api/users/'+id,{method:'DELETE'}),p=await r.json();if(!r.ok)return msg(p.detail||'Ошибка удаления','error');await load();msg('Пользователь удален.','success')};q('cancel').onclick=reset;q('save').onclick=async()=>{if(!verified)return msg('Сначала найдите пользователя в Active Directory.','error');syncRights();const id=q('user-id').value,payload={login:q('login').value.trim(),display_name:q('display-name').value.trim(),enabled:q('enabled').checked,can_view_report:q('basic').checked,can_import:q('import-right').checked,is_admin:q('admin-right').checked};try{const r=await fetch(id?'/api/users/'+id:'/api/users',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка сохранения');reset();await load();msg('Пользователь сохранен.','success')}catch(e){msg(e.message,'error')}};syncRights();load().catch(e=>msg(e.message,'error'));</script></body></html>"""
 
-SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card,.item{background:#fff;border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.card{margin-bottom:18px}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px;padding-left:18px;border-left:2px solid #e5e7eb;box-sizing:border-box}.link{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.link:hover{background:#f2f4f7}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 8px;font-size:18px}.small,p{color:#667085;font-size:13px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:18px}.item{display:flex;flex-direction:column;min-height:150px;border:1px solid #e1e5ea}.item .link{margin-top:auto;align-self:flex-start;background:#175cd3;color:#fff;border-color:#175cd3}@media(max-width:800px){.grid{grid-template-columns:1fr}.header{flex-direction:column}.actions{min-width:100%;padding:16px 0 0;border-left:0;border-top:2px solid #e5e7eb}}</style></head><body><div class="card"><div class="header"><div><h1>Настройки</h1><div class="small">Управление рассылкой, контролирующими и журналом уведомлений.</div></div><div class="actions"><a class="link" href="/admin/">Импорт участников</a><a class="link" href="/">Отчет</a></div></div></div><div class="grid"><section class="item"><h2>Пользователи и права</h2><p>Базовый доступ, импорт и полный административный доступ.</p><a class="link" href="/admin/settings/users/">Открыть</a></section><section class="item"><h2>Общие настройки</h2><p>Интервал и максимальное количество напоминаний, уведомление контролирующих и срок хранения журнала.</p><a class="link" href="/admin/settings/general/">Открыть</a></section><section class="item"><h2>Контролирующие</h2><p>Назначение контролирующих по тестам и получение технических ошибок.</p><a class="link" href="/admin/settings/reviewers/">Открыть</a></section><section class="item"><h2>Журнал уведомлений</h2><p>Просмотр событий рассылки, уведомлений контролирующим и технических ошибок.</p><a class="link" href="/admin/journal/">Открыть</a></section><section class="item"><h2>Сопоставление логинов</h2><p>Ручное сопоставление e-mail работников с логинами Indigo.</p><a class="link" href="/admin/logins/">Открыть</a></section><section class="item"><h2>Тесты и письма</h2><p>Добавление и изменение тестов, выбор теста Indigo, участники, приглашение и напоминание.</p><a class="link" href="/admin/settings/tests/">Открыть</a></section><section class="item"><h2>Системные шаблоны</h2><p>Уведомления контролирующим и технические сообщения.</p><a class="link" href="/admin/settings/templates/">Открыть</a></section><section class="item"><h2>Резервное копирование</h2><p>Автоматические и ручные копии базы данных и конфигурации.</p><a class="link" href="/admin/settings/backups/">Открыть</a></section></div></body></html>"""
+SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card,.item{background:#fff;border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.card{margin-bottom:18px}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px;padding-left:18px;border-left:2px solid #e5e7eb;box-sizing:border-box}.link{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.link:hover{background:#f2f4f7}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 8px;font-size:18px}.small,p{color:#667085;font-size:13px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:18px}.item{display:flex;flex-direction:column;min-height:150px;border:1px solid #e1e5ea}.item .link{margin-top:auto;align-self:flex-start;background:#175cd3;color:#fff;border-color:#175cd3}@media(max-width:800px){.grid{grid-template-columns:1fr}.header{flex-direction:column}.actions{min-width:100%;padding:16px 0 0;border-left:0;border-top:2px solid #e5e7eb}}</style></head><body><div class="card"><div class="header"><div><h1>Настройки</h1><div class="small">Управление рассылкой, контролирующими и журналом уведомлений.</div></div><div class="actions"><a class="link" href="/admin/">Импорт участников</a><a class="link" href="/">Отчет</a></div></div></div><div class="grid"><section class="item"><h2>Пользователи и права</h2><p>Базовый доступ, импорт и полный административный доступ.</p><a class="link" href="/admin/settings/users/">Открыть</a></section><section class="item"><h2>Active Directory</h2><p>Подключение к домену, проверка пользователей и доменная авторизация.</p><a class="link" href="/admin/settings/ad/">Открыть</a></section><section class="item"><h2>Общие настройки</h2><p>Интервал и максимальное количество напоминаний, уведомление контролирующих и срок хранения журнала.</p><a class="link" href="/admin/settings/general/">Открыть</a></section><section class="item"><h2>Контролирующие</h2><p>Назначение контролирующих по тестам и получение технических ошибок.</p><a class="link" href="/admin/settings/reviewers/">Открыть</a></section><section class="item"><h2>Журнал уведомлений</h2><p>Просмотр событий рассылки, уведомлений контролирующим и технических ошибок.</p><a class="link" href="/admin/journal/">Открыть</a></section><section class="item"><h2>Сопоставление логинов</h2><p>Ручное сопоставление e-mail работников с логинами Indigo.</p><a class="link" href="/admin/logins/">Открыть</a></section><section class="item"><h2>Тесты и письма</h2><p>Добавление и изменение тестов, выбор теста Indigo, участники, приглашение и напоминание.</p><a class="link" href="/admin/settings/tests/">Открыть</a></section><section class="item"><h2>Системные шаблоны</h2><p>Уведомления контролирующим и технические сообщения.</p><a class="link" href="/admin/settings/templates/">Открыть</a></section><section class="item"><h2>Резервное копирование</h2><p>Автоматические и ручные копии базы данных и конфигурации.</p><a class="link" href="/admin/settings/backups/">Открыть</a></section></div></body></html>"""
 
 
 TEMPLATES_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Системные шаблоны</title><style>
@@ -1887,7 +2069,7 @@ let items=[];const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':
   try{const r=await fetch('/api/settings/public-report');const p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка загрузки');box.checked=!!p.enabled}catch(e){show(e.message,'error')}
   button.onclick=async()=>{try{const r=await fetch('/api/settings/public-report',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:box.checked})});const p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка сохранения');show('Настройка сохранена.','success')}catch(e){show(e.message,'error')}};
 })();
-</script></script></body></html>"""
+</script></body></html>"""
 
 
 TESTS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Тесты и письма</title><style>
@@ -1899,6 +2081,9 @@ let tests=[],catalog=[],current=null,creating=false;const $=id=>document.getElem
 
 
 BACKUPS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Резервное копирование</title><style>body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px;padding-left:18px;border-left:2px solid #e5e7eb;box-sizing:border-box}.header-button{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.header-button:hover{background:#f2f4f7}h1{margin:0 0 8px;font-size:24px}h2{margin-top:0}.row{display:flex;gap:14px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:5px}.field input{padding:9px;border:1px solid #cfd4dc;border-radius:7px}.button,.link{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;padding:9px 13px;border:0;border-radius:7px;background:#175cd3;color:#fff;text-decoration:none;font-size:13px;font-weight:600;cursor:pointer}.secondary{background:#fff;color:#344054;border:1px solid #98a2b3}.restore{background:#175cd3}.danger{background:#b42318}.small{color:#667085;font-size:13px;line-height:1.45}.table{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px;border-bottom:1px solid #e1e5ea;text-align:left;vertical-align:top}.status{margin-top:12px;white-space:pre-wrap}.modal-backdrop{position:fixed;inset:0;background:rgba(16,24,40,.55);display:none;align-items:center;justify-content:center;padding:20px;z-index:100}.modal-backdrop.open{display:flex}.modal{width:min(680px,100%);max-height:90vh;overflow:auto;background:#fff;border-radius:12px;padding:20px;box-shadow:0 20px 50px rgba(0,0,0,.25)}.modal h2{margin:0 0 10px}.modal-grid{display:grid;grid-template-columns:170px 1fr;gap:7px 12px;margin:14px 0}.warning{padding:12px;border:1px solid #f3b7b2;border-radius:8px;background:#fef3f2;color:#912018}.checks{display:grid;gap:8px;margin:14px 0}.checks label.disabled{color:#98a2b3}.modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}@media(max-width:800px){.header{flex-direction:column}.actions{flex:1 1 auto;min-width:0;padding:14px 0 0;border-left:0;border-top:2px solid #e5e7eb}.modal-grid{grid-template-columns:1fr}.modal-actions{flex-direction:column-reverse}.modal-actions .button{width:100%}}</style></head><body><div class="card"><div class="header"><div><h1>Резервное копирование</h1><div class="small">Копии сохраняются в подключенном каталоге <code>/backups</code>. В архив входят безопасный снимок SQLite, конфигурация и рабочие данные приложения.</div></div><div class="actions"><a class="header-button" href="/admin/settings/">Настройки</a><a class="header-button" href="/">Отчет</a></div></div></div><div class="card"><h2>Автоматическое создание</h2><div class="row"><label><input id="enabled" type="checkbox"> Включено</label><div class="field"><label>Час</label><input id="hour" type="number" min="0" max="23"></div><div class="field"><label>Минута</label><input id="minute" type="number" min="0" max="59"></div><div class="field"><label>Хранить успешных копий</label><input id="retention" type="number" min="1" max="365"></div><button class="button" onclick="saveSettings()">Сохранить</button></div><div id="settingsStatus" class="status small"></div></div><div class="card"><h2>Резервные копии</h2><button class="button" onclick="createBackup()">Создать копию</button> <button class="button secondary" onclick="loadBackups()">Обновить список</button><div id="actionStatus" class="status small"></div><div class="table"><table><thead><tr><th>Создана</th><th>Тип</th><th>Размер</th><th>Версия</th><th>SHA-256</th><th>Действия</th></tr></thead><tbody id="items"></tbody></table></div></div><div id="restoreModal" class="modal-backdrop" onclick="backdropClose(event)"><div class="modal"><h2>Восстановление резервной копии</h2><div id="restoreInfo" class="modal-grid"></div><div id="restoreWarning" class="warning">Текущая база данных будет заменена. Перед восстановлением система автоматически создаст страховочную копию. После завершения необходимо перезапустить контейнеры.</div><div class="checks"><label><input id="restoreConfig" type="checkbox" checked> Восстановить каталог config</label><label><input id="restoreData" type="checkbox" checked> Восстановить каталог data</label><label><input id="restoreEnv" type="checkbox"> Восстановить .env</label><label><input id="restoreCompose" type="checkbox"> Восстановить docker-compose.yml</label></div><div id="restoreStatus" class="status small"></div><div class="modal-actions"><button class="button secondary" onclick="closeRestore()">Отмена</button><button id="restoreConfirm" class="button restore" onclick="confirmRestore()">Восстановить</button></div></div></div><script>let restoreName='';function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function size(v){if(v<1024)return v+' Б';if(v<1048576)return (v/1024).toFixed(1)+' КБ';return (v/1048576).toFixed(1)+' МБ'}async function json(url,opt){const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'Ошибка запроса');return d}async function loadSettings(){const d=await json('/api/settings/backups');enabled.checked=d.enabled;hour.value=d.hour;minute.value=d.minute;retention.value=d.retention;settingsStatus.textContent=d.last_auto_run?'Последний автоматический запуск: '+d.last_auto_run:''}async function saveSettings(){try{await json('/api/settings/backups',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled.checked,hour:+hour.value,minute:+minute.value,retention:+retention.value})});settingsStatus.textContent='Настройки сохранены';await loadBackups()}catch(e){settingsStatus.textContent=e.message}}async function loadBackups(){try{const d=await json('/api/backups');items.innerHTML=d.items.map(x=>`<tr><td>${esc(x.created_at||x.modified_at)}</td><td>${esc(x.trigger||'–')}</td><td>${size(x.size)}</td><td>${esc(x.application_version||'–')}</td><td title="${esc(x.sha256)}">${esc((x.sha256||'').slice(0,16))}…</td><td><a class="link secondary" href="/api/backups/${encodeURIComponent(x.name)}/download">Скачать</a> <button class="button secondary" onclick="verifyBackup('${esc(x.name)}')">Проверить</button> <button class="button restore" onclick="openRestore('${esc(x.name)}')">Восстановить</button> <button class="button danger" onclick="deleteBackup('${esc(x.name)}')">Удалить</button></td></tr>`).join('')||'<tr><td colspan="6">Копий пока нет</td></tr>'}catch(e){actionStatus.textContent=e.message}}async function createBackup(){actionStatus.textContent='Создание копии...';try{const d=await json('/api/backups',{method:'POST'});actionStatus.textContent='Создана '+d.name;await loadBackups()}catch(e){actionStatus.textContent=e.message}}async function verifyBackup(n){actionStatus.textContent='Проверка...';try{const d=await json('/api/backups/'+encodeURIComponent(n)+'/verify',{method:'POST'});actionStatus.textContent=d.valid?'Архив исправен. Проверено файлов: '+d.checked_files:'Ошибки: '+d.errors.join('; ')}catch(e){actionStatus.textContent=e.message}}async function openRestore(n){restoreName=n;restoreStatus.textContent='Проверка архива...';restoreConfirm.disabled=true;restoreModal.classList.add('open');try{const d=await json('/api/backups/'+encodeURIComponent(n)+'/restore-preview');restoreInfo.innerHTML=`<strong>Файл</strong><span>${esc(d.name)}</span><strong>Создана</strong><span>${esc(d.created_at||'–')}</span><strong>Версия приложения</strong><span>${esc(d.application_version||'–')}</span><strong>Файлов</strong><span>${d.files_count}</span><strong>Объем данных</strong><span>${size(d.files_size)}</span><strong>Проверка</strong><span>${d.valid?'Архив исправен':'Архив поврежден'}</span>`;setOption(restoreConfig,d.components.config,true);setOption(restoreData,d.components.data,true);setOption(restoreEnv,d.components.env,false);setOption(restoreCompose,d.components.compose,false);restoreStatus.textContent=d.valid?'Выберите дополнительные компоненты и подтвердите восстановление.':'Восстановление невозможно: '+d.errors.join('; ');restoreConfirm.disabled=!d.valid}catch(e){restoreStatus.textContent=e.message;restoreConfirm.disabled=true}}function setOption(el,available,checked){el.disabled=!available;el.checked=available&&checked;el.parentElement.classList.toggle('disabled',!available)}function closeRestore(){restoreModal.classList.remove('open');restoreName=''}function backdropClose(e){if(e.target===restoreModal)closeRestore()}async function confirmRestore(){if(!restoreName)return;if(!confirm('Восстановить данные из '+restoreName+'? Текущая база будет заменена.'))return;restoreConfirm.disabled=true;restoreStatus.textContent='Создание страховочной копии и восстановление...';try{const d=await json('/api/backups/'+encodeURIComponent(restoreName)+'/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({restore_config:restoreConfig.checked,restore_data:restoreData.checked,restore_env:restoreEnv.checked,restore_compose:restoreCompose.checked})});restoreStatus.textContent='Восстановлено: '+d.restored.join(', ')+'. Страховочная копия: '+d.safety_backup+'. Выполните: '+d.restart_command;actionStatus.textContent='Восстановление завершено. Требуется перезапуск контейнеров.';await loadBackups()}catch(e){restoreStatus.textContent=e.message}finally{restoreConfirm.disabled=false}}async function deleteBackup(n){if(!confirm('Удалить резервную копию '+n+'?'))return;try{await json('/api/backups/'+encodeURIComponent(n),{method:'DELETE'});actionStatus.textContent='Копия удалена';await loadBackups()}catch(e){actionStatus.textContent=e.message}}loadSettings();loadBackups();</script></body></html>"""
+
+AD_SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Active Directory</title><style>body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.field label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}.field input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #98a2b3;border-radius:7px}.check{display:flex;gap:10px;align-items:center;margin:12px 0}.buttons{display:flex;gap:10px;flex-wrap:wrap}.button{padding:10px 14px;border:1px solid #98a2b3;border-radius:7px;background:#fff;font-weight:600;cursor:pointer;text-decoration:none;color:#344054}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.message{display:none;margin-top:12px;padding:11px;border-radius:7px}.success{display:block;background:#ecfdf3;color:#05603a}.error{display:block;background:#fef3f2;color:#912018}.small{color:#667085;font-size:13px}@media(max-width:800px){.grid{grid-template-columns:1fr}}</style></head><body><div class="card"><h1>Active Directory</h1><p class="small">Настройка доменной авторизации и поиска пользователей. Пароли входящих пользователей не сохраняются. Пароль служебной учетной записи хранится в базе приложения.</p><div class="buttons"><a class="button" href="/admin/settings/users/">Пользователи и права</a><a class="button" href="/admin/settings/">Настройки</a></div></div><div class="card"><label class="check"><input id="enabled" type="checkbox"><b>Использовать авторизацию Active Directory</b></label><div class="grid"><div class="field"><label>Сервер AD</label><input id="server" placeholder="dc01.example.local"></div><div class="field"><label>Порт</label><input id="port" type="number" value="389"></div><div class="field"><label>Домен NetBIOS</label><input id="domain" placeholder="EXAMPLE"></div><div class="field"><label>Base DN</label><input id="base-dn" placeholder="DC=example,DC=local"></div><div class="field"><label>Служебный логин</label><input id="bind-user" placeholder="svc.invite-mailer"></div><div class="field"><label>Пароль служебной учетной записи</label><input id="bind-password" type="password" placeholder="Оставьте пустым, чтобы не менять"></div><div class="field"><label>LDAP-фильтр пользователя</label><input id="user-filter" value="(sAMAccountName={login})"></div><div class="field"><label>Группа администраторов домена</label><input id="admins-group" value="Domain Admins"></div></div><label class="check"><input id="ssl" type="checkbox"><b>Использовать LDAPS</b></label><label class="check"><input id="admins-enabled" type="checkbox"><b>Члены указанной группы получают полный доступ</b></label><div class="buttons"><button id="save" class="button primary">Сохранить</button><button id="test" class="button">Проверить подключение</button></div><div id="message" class="message"></div></div><script>const q=id=>document.getElementById(id);function msg(t,k){q('message').textContent=t;q('message').className='message '+k}async function load(){const r=await fetch('/api/settings/ad'),p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка загрузки');q('enabled').checked=p.enabled;q('server').value=p.server;q('port').value=p.port;q('ssl').checked=p.use_ssl;q('domain').value=p.domain;q('base-dn').value=p.base_dn;q('bind-user').value=p.bind_user;q('user-filter').value=p.user_filter;q('admins-enabled').checked=p.domain_admins_enabled;q('admins-group').value=p.domain_admins_group;q('bind-password').placeholder=p.bind_password_set?'Пароль сохранен. Оставьте пустым, чтобы не менять':'Введите пароль'}function payload(){return{enabled:q('enabled').checked,server:q('server').value.trim(),port:Number(q('port').value),use_ssl:q('ssl').checked,domain:q('domain').value.trim(),base_dn:q('base-dn').value.trim(),bind_user:q('bind-user').value.trim(),bind_password:q('bind-password').value,user_filter:q('user-filter').value.trim(),domain_admins_enabled:q('admins-enabled').checked,domain_admins_group:q('admins-group').value.trim()}}q('save').onclick=async()=>{try{const r=await fetch('/api/settings/ad',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())}),p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка сохранения');q('bind-password').value='';msg(p.message,'success');await load()}catch(e){msg(e.message,'error')}};q('test').onclick=async()=>{try{const r=await fetch('/api/settings/ad/test',{method:'POST'}),p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка подключения');msg(p.message,'success')}catch(e){msg(e.message,'error')}};load().catch(e=>msg(e.message,'error'));</script></body></html>"""
+
 
 GENERAL_SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Общие настройки</title><style>
 body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px;padding-left:18px;border-left:2px solid #e5e7eb;box-sizing:border-box}.link,button{display:inline-flex;align-items:center;justify-content:center;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff;cursor:pointer}.link:hover,button:hover{background:#f2f4f7}.actions .link{width:100%}h2{margin-top:0}.small,.hint{color:#667085;font-size:12px;line-height:1.45}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.row{display:grid;grid-template-columns:minmax(220px,1fr) minmax(220px,320px);gap:16px;align-items:center;padding:11px 0;border-bottom:1px solid #eaecf0}label{font-weight:600}input,select,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px;background:#fff}input[type=checkbox]{width:20px;height:20px}.buttons{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.message{display:none;margin-top:14px;padding:12px;border-radius:7px}.success{display:block;background:#ecfdf3;color:#05603a}.error{display:block;background:#fef3f2;color:#912018}.status{padding:8px 10px;border-radius:6px;background:#f2f4f7;font-size:12px;margin-bottom:12px}.wide{grid-column:1/-1}@media(max-width:900px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}@media(max-width:720px){.header{flex-direction:column}.row{grid-template-columns:1fr}}
