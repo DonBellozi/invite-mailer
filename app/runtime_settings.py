@@ -52,9 +52,10 @@ def bootstrap_runtime_settings(settings: Settings, db: Database) -> None:
         "indigo_sslmode": settings.indigo.sslmode,
         "indigo_connect_timeout": str(settings.indigo.connect_timeout),
         "indigo_view": settings.indigo.view,
+        "indigo_sync_interval_minutes": "15",
         "allowed_domains": "\n".join(str(x).strip().lower() for x in domains if str(x).strip()),
         "validate_domain": "1" if settings.config.get("mail", {}).get("validate_domain", True) else "0",
-        "integration_settings_bootstrap_version": "1",
+        "integration_settings_bootstrap_version": "2",
     }
     _insert_missing(db, defaults)
     apply_runtime_settings(settings, db)

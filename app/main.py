@@ -4,9 +4,8 @@ import argparse
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from sched import scheduler
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -32,6 +31,47 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 LOGGER = logging.getLogger("invite-mailer")
+
+
+def _read_app_setting(db: Database, key: str, default: str) -> str:
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+    return str(row["value"]) if row else default
+
+
+def _indigo_sync_due(db: Database) -> bool:
+    try:
+        interval = int(_read_app_setting(db, "indigo_sync_interval_minutes", "15"))
+    except (TypeError, ValueError):
+        interval = 15
+    interval = max(1, min(interval, 1440))
+
+    last_text = _read_app_setting(db, "indigo_last_auto_sync_at", "").strip()
+    if not last_text:
+        return True
+    try:
+        last_run = datetime.fromisoformat(last_text)
+        if last_run.tzinfo is None:
+            last_run = last_run.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+
+    return datetime.now(timezone.utc) >= last_run.astimezone(timezone.utc) + timedelta(minutes=interval)
+
+
+def _mark_indigo_sync_attempt(db: Database) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO app_settings(key,value,updated_at) "
+            "VALUES('indigo_last_auto_sync_at',?,?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value=excluded.value, updated_at=excluded.updated_at",
+            (now, now),
+        )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -114,6 +154,8 @@ def scheduler_mode(settings, db: Database) -> None:
             LOGGER.exception("Ошибка автоматической отправки напоминаний")
 
     def indigo_job():
+        if not _indigo_sync_due(db):
+            return
         try:
             count = sync_indigo_results(
                 settings,
@@ -131,6 +173,7 @@ def scheduler_mode(settings, db: Database) -> None:
             )
 
         finally:
+            _mark_indigo_sync_attempt(db)
             try:
                 rebuild_report(
                     settings,
@@ -184,10 +227,10 @@ def scheduler_mode(settings, db: Database) -> None:
     scheduler.add_job(
         indigo_job,
         CronTrigger(
-            minute=15,
+            minute="*",
             timezone=timezone,
         ),
-        id="hourly_indigo_sync",
+        id="automatic_indigo_sync",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
