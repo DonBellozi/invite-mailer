@@ -101,6 +101,21 @@ def _ensure_v202_schema(db: Database) -> None:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS app_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                login TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                display_name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                can_view_report INTEGER NOT NULL DEFAULT 1,
+                can_import INTEGER NOT NULL DEFAULT 0,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS reviewers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -124,6 +139,7 @@ def _ensure_v202_schema(db: Database) -> None:
             "reminder_run_minute": "15",
             "reminder_run_day_of_week": "6",
             "indigo_sync_interval_minutes": "15",
+            "public_report_enabled": "1",
         }
         now = _utc_now()
         for key, value in defaults.items():
@@ -239,23 +255,116 @@ def _display_name(username: str) -> str:
     return configured or username
 
 
-def require_admin(request: Request) -> str:
+def _emergency_admin_login() -> str:
+    return os.getenv("ADMIN_USERNAME", "").strip()
+
+
+def _user_record(username: str) -> dict | None:
+    login = username.strip()
+    if not login:
+        return None
+    with database().connect() as connection:
+        row = connection.execute(
+            "SELECT id, login, display_name, enabled, can_view_report, can_import, is_admin "
+            "FROM app_users WHERE login = ? COLLATE NOCASE",
+            (login,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _permissions(request: Request) -> dict:
     username = str(request.session.get("username", "")).strip()
-    if username:
-        return username
-
-    if request.url.path.startswith("/api/"):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Требуется авторизация",
-        )
-
-    next_url = _safe_next(request.url.path)
-    raise HTTPException(
-        status_code=status.HTTP_303_SEE_OTHER,
-        detail="Требуется авторизация",
-        headers={"Location": f"/login?next={next_url}"},
+    if not username:
+        return {
+            "authenticated": False, "username": "", "display_name": "",
+            "can_view_report": False, "can_import": False, "is_admin": False,
+            "enabled": False, "emergency_admin": False,
+        }
+    emergency = bool(_emergency_admin_login()) and secrets.compare_digest(
+        username.casefold(), _emergency_admin_login().casefold()
     )
+    if emergency:
+        return {
+            "authenticated": True, "username": username,
+            "display_name": str(request.session.get("display_name", "")).strip() or _display_name(username),
+            "can_view_report": True, "can_import": True, "is_admin": True,
+            "enabled": True, "emergency_admin": True,
+        }
+    user = _user_record(username)
+    if not user or not bool(user["enabled"]):
+        return {
+            "authenticated": True, "username": username,
+            "display_name": (str(user.get("display_name", "")) if user else username),
+            "can_view_report": False, "can_import": False, "is_admin": False,
+            "enabled": False, "emergency_admin": False,
+        }
+    is_admin = bool(user["is_admin"])
+    can_import = is_admin or bool(user["can_import"])
+    can_view = is_admin or can_import or bool(user["can_view_report"])
+    return {
+        "authenticated": True, "username": str(user["login"]),
+        "display_name": str(user["display_name"]),
+        "can_view_report": can_view, "can_import": can_import,
+        "is_admin": is_admin, "enabled": True, "emergency_admin": False,
+    }
+
+
+def _deny(request: Request, detail: str = "Недостаточно прав") -> None:
+    if request.url.path.startswith("/api/"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+    raise HTTPException(status_code=status.HTTP_303_SEE_OTHER, detail=detail, headers={"Location": "/"})
+
+
+def require_authenticated(request: Request) -> str:
+    permissions = _permissions(request)
+    if permissions["authenticated"]:
+        return str(permissions["username"])
+    if request.url.path.startswith("/api/"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Требуется авторизация")
+    next_url = _safe_next(request.url.path)
+    raise HTTPException(status_code=status.HTTP_303_SEE_OTHER, detail="Требуется авторизация", headers={"Location": f"/login?next={next_url}"})
+
+
+def require_report(request: Request) -> str:
+    if _read_setting("public_report_enabled", "1") == "1":
+        return "public"
+    permissions = _permissions(request)
+    if not permissions["authenticated"]:
+        if request.url.path.startswith("/api/"):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Требуется авторизация")
+        raise HTTPException(status_code=status.HTTP_303_SEE_OTHER, headers={"Location": f"/login?next={_safe_next(request.url.path)}"})
+    if not permissions["enabled"] or not permissions["can_view_report"]:
+        _deny(request, "Для учетной записи не предоставлен базовый доступ")
+    return str(permissions["username"])
+
+
+def require_import(request: Request) -> str:
+    require_authenticated(request)
+    permissions = _permissions(request)
+    if not permissions["enabled"] or not permissions["can_import"]:
+        _deny(request, "Нет права на импорт сотрудников")
+    return str(permissions["username"])
+
+
+def require_admin(request: Request) -> str:
+    require_authenticated(request)
+    permissions = _permissions(request)
+    if not permissions["enabled"] or not permissions["is_admin"]:
+        _deny(request, "Требуются права администратора")
+    return str(permissions["username"])
+
+
+class UserAccessRequest(BaseModel):
+    login: str
+    display_name: str
+    enabled: bool = True
+    can_view_report: bool = True
+    can_import: bool = False
+    is_admin: bool = False
+
+
+class PublicAccessRequest(BaseModel):
+    enabled: bool = True
 
 
 class ConfirmRequest(BaseModel):
@@ -418,13 +527,23 @@ def login_submit(request: Request, username: Annotated[str, Form()], password: A
 
 @app.get("/api/auth/me")
 def auth_me(request: Request):
-    username = str(request.session.get("username", "")).strip()
-    return {
-        "authenticated": bool(username),
-        "username": username,
-        "display_name": str(request.session.get("display_name", "")).strip() or (_display_name(username) if username else ""),
-        "role": "Администратор" if username else "",
-    }
+    permissions = _permissions(request)
+    permissions["public_report_enabled"] = _read_setting("public_report_enabled", "1") == "1"
+    if permissions["is_admin"]:
+        permissions["role"] = "Администратор"
+    elif permissions["can_import"]:
+        permissions["role"] = "Импорт"
+    elif permissions["can_view_report"]:
+        permissions["role"] = "Базовый доступ"
+    else:
+        permissions["role"] = ""
+    return permissions
+
+
+@app.get("/api/access/report")
+def report_access(request: Request):
+    require_report(request)
+    return JSONResponse(status_code=204, content=None)
 
 
 @app.post("/api/auth/logout")
@@ -442,7 +561,7 @@ async def audience_error_handler(_, error: AudienceImportError):
 
 
 @app.get("/admin/", response_class=HTMLResponse)
-def admin_page(_: Annotated[str, Depends(require_admin)]) -> str:
+def admin_page(_: Annotated[str, Depends(require_import)]) -> str:
     return ADMIN_HTML
 
 
@@ -454,6 +573,11 @@ def settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
 @app.get("/admin/settings/general/", response_class=HTMLResponse)
 def general_settings_page(_: Annotated[str, Depends(require_admin)]) -> str:
     return GENERAL_SETTINGS_HTML
+
+
+@app.get("/admin/settings/users/", response_class=HTMLResponse)
+def users_page(_: Annotated[str, Depends(require_admin)]) -> str:
+    return USERS_HTML
 
 
 @app.get("/admin/settings/backups/", response_class=HTMLResponse)
@@ -943,6 +1067,90 @@ def write_domain_settings(request: DomainSettingsRequest, _: Annotated[str, Depe
     return {"ok": True, "message": f"Домены сохранены: {len(normalized)}.", "items": normalized}
 
 
+@app.get("/api/settings/public-report")
+def get_public_report_setting(_: Annotated[str, Depends(require_admin)]):
+    return {"enabled": _read_setting("public_report_enabled", "1") == "1"}
+
+
+@app.put("/api/settings/public-report")
+def set_public_report_setting(payload: PublicAccessRequest, _: Annotated[str, Depends(require_admin)]):
+    _write_setting("public_report_enabled", "1" if payload.enabled else "0")
+    return {"ok": True, "enabled": payload.enabled}
+
+
+@app.get("/api/users")
+def list_users(_: Annotated[str, Depends(require_admin)]):
+    with database().connect() as connection:
+        rows = connection.execute(
+            "SELECT id, login, display_name, enabled, can_view_report, can_import, is_admin, created_at, updated_at "
+            "FROM app_users ORDER BY display_name COLLATE NOCASE, login COLLATE NOCASE"
+        ).fetchall()
+    return {"items": [dict(row) for row in rows], "emergency_admin_login": _emergency_admin_login()}
+
+
+@app.post("/api/users")
+def create_user(payload: UserAccessRequest, _: Annotated[str, Depends(require_admin)]):
+    login = payload.login.strip()
+    display_name = payload.display_name.strip() or login
+    if not login:
+        raise HTTPException(status_code=400, detail="Не указан логин")
+    if _emergency_admin_login() and login.casefold() == _emergency_admin_login().casefold():
+        raise HTTPException(status_code=400, detail="Встроенная учетная запись администратора управляется через .env")
+    is_admin = bool(payload.is_admin)
+    can_import = is_admin or bool(payload.can_import)
+    can_view = is_admin or can_import or bool(payload.can_view_report)
+    now = _utc_now()
+    try:
+        with database().connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO app_users(login,display_name,enabled,can_view_report,can_import,is_admin,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (login, display_name, int(payload.enabled), int(can_view), int(can_import), int(is_admin), now, now),
+            )
+        return {"ok": True, "id": cursor.lastrowid}
+    except Exception as error:
+        if "UNIQUE" in str(error).upper():
+            raise HTTPException(status_code=409, detail="Пользователь с таким логином уже существует")
+        raise
+
+
+@app.put("/api/users/{user_id}")
+def update_user(user_id: int, payload: UserAccessRequest, _: Annotated[str, Depends(require_admin)]):
+    login = payload.login.strip()
+    display_name = payload.display_name.strip() or login
+    if not login:
+        raise HTTPException(status_code=400, detail="Не указан логин")
+    if _emergency_admin_login() and login.casefold() == _emergency_admin_login().casefold():
+        raise HTTPException(status_code=400, detail="Встроенная учетная запись администратора управляется через .env")
+    is_admin = bool(payload.is_admin)
+    can_import = is_admin or bool(payload.can_import)
+    can_view = is_admin or can_import or bool(payload.can_view_report)
+    try:
+        with database().connect() as connection:
+            cursor = connection.execute(
+                "UPDATE app_users SET login=?, display_name=?, enabled=?, can_view_report=?, can_import=?, is_admin=?, updated_at=? WHERE id=?",
+                (login, display_name, int(payload.enabled), int(can_view), int(can_import), int(is_admin), _utc_now(), user_id),
+            )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as error:
+        if "UNIQUE" in str(error).upper():
+            raise HTTPException(status_code=409, detail="Пользователь с таким логином уже существует")
+        raise
+
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: int, _: Annotated[str, Depends(require_admin)]):
+    with database().connect() as connection:
+        cursor = connection.execute("DELETE FROM app_users WHERE id=?", (user_id,))
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    return {"ok": True}
+
+
 @app.get("/api/reviewers")
 def read_reviewers(_: Annotated[str, Depends(require_admin)]):
     settings().templates[:] = load_test_definitions(settings(), database())
@@ -1140,7 +1348,7 @@ def remove_login_override(
 
 
 @app.get("/api/audience/templates")
-def list_templates(_: Annotated[str, Depends(require_admin)]):
+def list_templates(_: Annotated[str, Depends(require_import)]):
     settings().templates[:] = load_test_definitions(settings(), database())
     result = []
     for template in explicit_templates(settings()):
@@ -1158,7 +1366,7 @@ def list_templates(_: Annotated[str, Depends(require_admin)]):
 async def preview_upload(
     template_id: Annotated[str, Form()],
     file: Annotated[UploadFile, File()],
-    username: Annotated[str, Depends(require_admin)],
+    username: Annotated[str, Depends(require_import)],
 ):
     settings().templates[:] = load_test_definitions(settings(), database())
     content = await file.read(MAX_UPLOAD_BYTES + 1)
@@ -1176,7 +1384,7 @@ async def preview_upload(
 
 
 @app.get("/api/audience/imports/{import_id}")
-def read_preview(import_id: int, _: Annotated[str, Depends(require_admin)]):
+def read_preview(import_id: int, _: Annotated[str, Depends(require_import)]):
     return get_preview(database(), import_id)
 
 
@@ -1184,7 +1392,7 @@ def read_preview(import_id: int, _: Annotated[str, Depends(require_admin)]):
 def confirm_import(
     import_id: int,
     request: ConfirmRequest,
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[str, Depends(require_import)],
 ):
     result = confirm_preview(database(), import_id, request.row_ids)
     rebuild_report(settings(), database(), sync_indigo=False)
@@ -1192,7 +1400,7 @@ def confirm_import(
 
 
 @app.get("/api/audience/imports/{import_id}/issues.xlsx")
-def download_issues(import_id: int, _: Annotated[str, Depends(require_admin)]):
+def download_issues(import_id: int, _: Annotated[str, Depends(require_import)]):
     content = build_issues_workbook(database(), import_id)
     headers = {
         "Content-Disposition": f'attachment; filename="audience_import_{import_id}_issues.xlsx"'
@@ -1208,6 +1416,7 @@ def download_issues(import_id: int, _: Annotated[str, Depends(require_admin)]):
 )
 def download_test_report_xlsx(
     template_id: str,
+    _: Annotated[str, Depends(require_report)],
 ):
     template = find_report_template(
         template_id
@@ -1239,6 +1448,7 @@ def download_test_report_xlsx(
 )
 def download_test_report_pdf(
     template_id: str,
+    _: Annotated[str, Depends(require_report)],
 ):
     template = find_report_template(
         template_id
@@ -1267,7 +1477,7 @@ def download_test_report_pdf(
 
 @app.get("/api/audience/template.xlsx")
 def download_audience_template(
-    _: Annotated[str, Depends(require_admin)],
+    _: Annotated[str, Depends(require_import)],
 ):
     content = build_audience_template()
 
@@ -1658,14 +1868,26 @@ TEMPLATE_VARIABLES_HTML = r"""<!doctype html><html lang="ru"><head><meta charset
 {% endfor %}</pre></div><div class="card"><h2>Технические уведомления</h2><p>Доступны <code>errors</code>, <code>errors_count</code>, <code>fio</code>, <code>email</code>, <code>error_type</code>, <code>error_text</code> и другие поля, передаваемые конкретным событием. Для проверки используйте кнопку отправки тестового письма.</p></div></body></html>"""
 
 
-SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card,.item{background:#fff;border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.card{margin-bottom:18px}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px;padding-left:18px;border-left:2px solid #e5e7eb;box-sizing:border-box}.link{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.link:hover{background:#f2f4f7}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 8px;font-size:18px}.small,p{color:#667085;font-size:13px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:18px}.item{display:flex;flex-direction:column;min-height:150px;border:1px solid #e1e5ea}.item .link{margin-top:auto;align-self:flex-start;background:#175cd3;color:#fff;border-color:#175cd3}@media(max-width:800px){.grid{grid-template-columns:1fr}.header{flex-direction:column}.actions{min-width:100%;padding:16px 0 0;border-left:0;border-top:2px solid #e5e7eb}}</style></head><body><div class="card"><div class="header"><div><h1>Настройки</h1><div class="small">Управление рассылкой, контролирующими и журналом уведомлений.</div></div><div class="actions"><a class="link" href="/admin/">Импорт участников</a><a class="link" href="/">Отчет</a></div></div></div><div class="grid"><section class="item"><h2>Общие настройки</h2><p>Интервал и максимальное количество напоминаний, уведомление контролирующих и срок хранения журнала.</p><a class="link" href="/admin/settings/general/">Открыть</a></section><section class="item"><h2>Контролирующие</h2><p>Назначение контролирующих по тестам и получение технических ошибок.</p><a class="link" href="/admin/settings/reviewers/">Открыть</a></section><section class="item"><h2>Журнал уведомлений</h2><p>Просмотр событий рассылки, уведомлений контролирующим и технических ошибок.</p><a class="link" href="/admin/journal/">Открыть</a></section><section class="item"><h2>Сопоставление логинов</h2><p>Ручное сопоставление e-mail работников с логинами Indigo.</p><a class="link" href="/admin/logins/">Открыть</a></section><section class="item"><h2>Тесты и письма</h2><p>Добавление и изменение тестов, выбор теста Indigo, участники, приглашение и напоминание.</p><a class="link" href="/admin/settings/tests/">Открыть</a></section><section class="item"><h2>Системные шаблоны</h2><p>Уведомления контролирующим и технические сообщения.</p><a class="link" href="/admin/settings/templates/">Открыть</a></section><section class="item"><h2>Резервное копирование</h2><p>Автоматические и ручные копии базы данных и конфигурации.</p><a class="link" href="/admin/settings/backups/">Открыть</a></section></div></body></html>"""
+
+USERS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Пользователи и права</title><style>body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px;padding-left:18px;border-left:2px solid #e5e7eb;box-sizing:border-box}.link,button{display:inline-flex;align-items:center;justify-content:center;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;background:#fff;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;cursor:pointer}.actions .link{width:100%}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.danger{color:#b42318;border-color:#f04438}.small{color:#667085;font-size:12px;line-height:1.45}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{margin-bottom:14px}label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}input[type=text]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}.checks{display:grid;gap:10px;margin:14px 0}.check{display:flex;gap:10px;align-items:flex-start}.check input{width:20px;height:20px;margin:0}.buttons{display:flex;gap:10px;flex-wrap:wrap}.message{display:none;margin-top:12px;padding:11px;border-radius:7px}.success{display:block;background:#ecfdf3;color:#05603a}.error{display:block;background:#fef3f2;color:#912018}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px;border-bottom:1px solid #e1e5ea;text-align:left;vertical-align:middle}.badge{display:inline-block;padding:3px 7px;border-radius:999px;background:#eef2f7;font-size:12px}.disabled{opacity:.55}@media(max-width:800px){.header{flex-direction:column}.actions{min-width:100%;padding:16px 0 0;border-left:0;border-top:2px solid #e5e7eb}.grid{grid-template-columns:1fr}}</style></head><body><div class="card"><div class="header"><div><h1>Пользователи и права</h1><div class="small">Локальный список доменных логинов. Проверка пароля Active Directory будет подключена отдельным этапом. Встроенный администратор из .env всегда имеет полный доступ.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div><div class="card"><h2 id="form-title">Добавить пользователя</h2><input id="user-id" type="hidden"><div class="grid"><div class="field"><label for="login">Логин Active Directory</label><input id="login" type="text" autocomplete="off" placeholder="ivanov.ii"></div><div class="field"><label for="display-name">Отображаемое имя</label><input id="display-name" type="text" autocomplete="off" placeholder="Иванов Иван Иванович"></div></div><div class="checks"><label class="check"><input id="enabled" type="checkbox" checked><span><b>Учетная запись включена</b><div class="small">Отключенный пользователь не получает доступ даже при назначенных правах.</div></span></label><label class="check"><input id="basic" type="checkbox" checked><span><b>Базовый доступ</b><div class="small">Просмотр отчета, когда публичный просмотр отключен.</div></span></label><label class="check"><input id="import-right" type="checkbox"><span><b>Импорт сотрудников</b><div class="small">Включает базовый доступ автоматически.</div></span></label><label class="check"><input id="admin-right" type="checkbox"><span><b>Администратор</b><div class="small">Полный доступ ко всему функционалу и настройкам.</div></span></label></div><div class="buttons"><button id="save" class="primary">Сохранить</button><button id="cancel" type="button">Отмена</button></div><div id="message" class="message"></div></div><div class="card"><div class="table-wrap"><table><thead><tr><th>Логин</th><th>Имя</th><th>Статус</th><th>Базовый</th><th>Импорт</th><th>Администратор</th><th>Действия</th></tr></thead><tbody id="body"></tbody></table></div></div><script>let items=[];const q=id=>document.getElementById(id),esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));function syncRights(){if(q('admin-right').checked){q('import-right').checked=true;q('basic').checked=true}if(q('import-right').checked)q('basic').checked=true;q('import-right').disabled=q('admin-right').checked;q('basic').disabled=q('admin-right').checked||q('import-right').checked}q('admin-right').onchange=syncRights;q('import-right').onchange=syncRights;function reset(){q('user-id').value='';q('login').value='';q('display-name').value='';q('enabled').checked=true;q('basic').checked=true;q('import-right').checked=false;q('admin-right').checked=false;q('form-title').textContent='Добавить пользователя';syncRights()}function msg(t,k){q('message').textContent=t;q('message').className='message '+k}function render(){q('body').innerHTML=items.map(x=>`<tr class="${x.enabled?'':'disabled'}"><td>${esc(x.login)}</td><td>${esc(x.display_name)}</td><td><span class="badge">${x.enabled?'Включен':'Отключен'}</span></td><td>${x.can_view_report?'Да':'Нет'}</td><td>${x.can_import?'Да':'Нет'}</td><td>${x.is_admin?'Да':'Нет'}</td><td><div class="buttons"><button type="button" onclick="editUser(${x.id})">Изменить</button><button type="button" class="danger" onclick="removeUser(${x.id})">Удалить</button></div></td></tr>`).join('')}async function load(){const r=await fetch('/api/users'),p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка загрузки');items=p.items;render()}window.editUser=id=>{const x=items.find(v=>v.id===id);if(!x)return;q('user-id').value=x.id;q('login').value=x.login;q('display-name').value=x.display_name;q('enabled').checked=!!x.enabled;q('basic').checked=!!x.can_view_report;q('import-right').checked=!!x.can_import;q('admin-right').checked=!!x.is_admin;q('form-title').textContent='Изменить пользователя';syncRights();scrollTo({top:0,behavior:'smooth'})};window.removeUser=async id=>{if(!confirm('Удалить локальную запись пользователя?'))return;const r=await fetch('/api/users/'+id,{method:'DELETE'}),p=await r.json();if(!r.ok)return msg(p.detail||'Ошибка удаления','error');await load();msg('Пользователь удален.','success')};q('cancel').onclick=reset;q('save').onclick=async()=>{syncRights();const id=q('user-id').value,payload={login:q('login').value.trim(),display_name:q('display-name').value.trim(),enabled:q('enabled').checked,can_view_report:q('basic').checked,can_import:q('import-right').checked,is_admin:q('admin-right').checked};try{const r=await fetch(id?'/api/users/'+id:'/api/users',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка сохранения');reset();await load();msg('Пользователь сохранен.','success')}catch(e){msg(e.message,'error')}};syncRights();load().catch(e=>msg(e.message,'error'));</script></body></html>"""
+
+SETTINGS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Настройки</title><style>body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.card,.item{background:#fff;border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.card{margin-bottom:18px}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px;padding-left:18px;border-left:2px solid #e5e7eb;box-sizing:border-box}.link{display:flex;align-items:center;justify-content:center;width:100%;min-height:38px;box-sizing:border-box;padding:9px 13px;border:1px solid #98a2b3;border-radius:7px;color:#344054;text-decoration:none;text-align:center;font-size:13px;font-weight:600;background:#fff}.link:hover{background:#f2f4f7}h1{margin:0 0 8px;font-size:24px}h2{margin:0 0 8px;font-size:18px}.small,p{color:#667085;font-size:13px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:18px}.item{display:flex;flex-direction:column;min-height:150px;border:1px solid #e1e5ea}.item .link{margin-top:auto;align-self:flex-start;background:#175cd3;color:#fff;border-color:#175cd3}@media(max-width:800px){.grid{grid-template-columns:1fr}.header{flex-direction:column}.actions{min-width:100%;padding:16px 0 0;border-left:0;border-top:2px solid #e5e7eb}}</style></head><body><div class="card"><div class="header"><div><h1>Настройки</h1><div class="small">Управление рассылкой, контролирующими и журналом уведомлений.</div></div><div class="actions"><a class="link" href="/admin/">Импорт участников</a><a class="link" href="/">Отчет</a></div></div></div><div class="grid"><section class="item"><h2>Пользователи и права</h2><p>Базовый доступ, импорт и полный административный доступ.</p><a class="link" href="/admin/settings/users/">Открыть</a></section><section class="item"><h2>Общие настройки</h2><p>Интервал и максимальное количество напоминаний, уведомление контролирующих и срок хранения журнала.</p><a class="link" href="/admin/settings/general/">Открыть</a></section><section class="item"><h2>Контролирующие</h2><p>Назначение контролирующих по тестам и получение технических ошибок.</p><a class="link" href="/admin/settings/reviewers/">Открыть</a></section><section class="item"><h2>Журнал уведомлений</h2><p>Просмотр событий рассылки, уведомлений контролирующим и технических ошибок.</p><a class="link" href="/admin/journal/">Открыть</a></section><section class="item"><h2>Сопоставление логинов</h2><p>Ручное сопоставление e-mail работников с логинами Indigo.</p><a class="link" href="/admin/logins/">Открыть</a></section><section class="item"><h2>Тесты и письма</h2><p>Добавление и изменение тестов, выбор теста Indigo, участники, приглашение и напоминание.</p><a class="link" href="/admin/settings/tests/">Открыть</a></section><section class="item"><h2>Системные шаблоны</h2><p>Уведомления контролирующим и технические сообщения.</p><a class="link" href="/admin/settings/templates/">Открыть</a></section><section class="item"><h2>Резервное копирование</h2><p>Автоматические и ручные копии базы данных и конфигурации.</p><a class="link" href="/admin/settings/backups/">Открыть</a></section></div></body></html>"""
 
 
 TEMPLATES_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Системные шаблоны</title><style>
 body{font-family:Arial,sans-serif;margin:24px;background:#f5f6f8;color:#222}.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 4px rgba(0,0,0,.08)}.header{display:flex;justify-content:space-between;gap:18px}.actions{display:flex;flex-direction:column;gap:10px;flex:0 0 190px;min-width:190px;padding-left:18px;border-left:2px solid #e5e7eb;box-sizing:border-box}.link,.button{display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:10px 14px;border:1px solid #98a2b3;border-radius:7px;background:#fff;color:#344054;text-decoration:none;font-weight:600;cursor:pointer}.actions .link{display:flex;width:100%;min-height:38px;padding:9px 13px;text-align:center;font-size:13px;font-weight:600}.actions .link:hover{background:#f2f4f7}.primary{background:#175cd3;color:#fff;border-color:#175cd3}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.full{grid-column:1/-1}label{display:block;font-size:12px;font-weight:600;margin:5px 0}input,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd2da;border-radius:6px}textarea{min-height:240px;font-family:Consolas,monospace}.small{font-size:12px;color:#667085}.message{display:none;padding:12px}.success{display:block;background:#ecfdf3}.error{display:block;background:#fef3f2}@media(max-width:800px){.grid{grid-template-columns:1fr}.full{grid-column:auto}.header{flex-direction:column}}
 </style></head><body><div class="card"><div class="header"><div><h1>Системные шаблоны</h1><div class="small">Общие письма контролирующему и технические уведомления.</div></div><div class="actions"><a class="link" href="/admin/settings/template-variables/">Переменные шаблонов</a><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div><div id="forms"></div><div id="message" class="message"></div><script>
 let items=[];const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));async function api(u,o={}){const r=await fetch(u,o);let p={};try{p=await r.json()}catch(_){p={}}if(!r.ok)throw new Error(typeof p.detail==='string'?p.detail:`HTTP ${r.status}`);return p}function msg(t,k){message.textContent=t;message.className=`message ${k}`}function title(k){return k==='reviewer'?'Уведомление контролирующему':'Техническое уведомление'}function render(){forms.innerHTML=items.filter(x=>['reviewer','technical'].includes(x.kind)).map((x,i)=>`<section class="card" data-key="${x.kind}"><h2>${title(x.kind)}</h2><div class="grid"><label><input type="checkbox" data-f="enabled" ${x.enabled?'checked':''}> Использовать шаблон</label><div></div><div class="full"><label>Тема</label><input data-f="subject" value="${esc(x.subject)}"></div><div class="full"><label>HTML-текст</label><textarea data-f="body_html">${esc(x.body_html)}</textarea></div><div><label>Тестовый e-mail</label><input type="email" data-f="recipient" placeholder="user@example.ru"></div><div style="display:flex;gap:10px;align-items:end"><button class="button" data-test>Отправить тестовое</button><button class="button primary" data-save>Сохранить</button></div></div></section>`).join('');document.querySelectorAll('[data-save]').forEach(b=>b.onclick=()=>save(b.closest('section')));document.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>test(b.closest('section')))}function val(sec,f){const e=sec.querySelector(`[data-f="${f}"]`);return f==='enabled'?e.checked:e.value}async function save(sec){const k=sec.dataset.key;await api(`/api/settings/templates/${k}/*`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({subject:val(sec,'subject'),body_html:val(sec,'body_html'),enabled:val(sec,'enabled')})});msg('Шаблон сохранен.','success')}async function test(sec){try{const k=sec.dataset.key;const r=await api('/api/settings/templates/test-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient:val(sec,'recipient'),kind:k,template_id:'*',subject:val(sec,'subject'),body_html:val(sec,'body_html')})});const source=r.data_source==='demo'?'использованы демонстрационные данные':r.data_source==='real_employee'?'использованы данные реального работника':'использованы реальные данные из базы';msg(`Тестовое письмо отправлено – ${source}${r.data_count?` (${r.data_count})`:''}.`,'success')}catch(e){msg(e.message,'error')}}async function load(){items=(await api('/api/settings/templates')).items;render()}load().catch(e=>msg(e.message,'error'));
-</script></body></html>"""
+
+<script>
+(async()=>{
+  const box=document.getElementById('public-report-enabled'), button=document.getElementById('public-report-save'), message=document.getElementById('public-report-message');
+  if(!box||!button)return;
+  const show=(text,kind)=>{message.textContent=text;message.className='message '+kind};
+  try{const r=await fetch('/api/settings/public-report');const p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка загрузки');box.checked=!!p.enabled}catch(e){show(e.message,'error')}
+  button.onclick=async()=>{try{const r=await fetch('/api/settings/public-report',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:box.checked})});const p=await r.json();if(!r.ok)throw new Error(p.detail||'Ошибка сохранения');show('Настройка сохранена.','success')}catch(e){show(e.message,'error')}};
+})();
+</script></script></body></html>"""
 
 
 TESTS_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Тесты и письма</title><style>
@@ -1683,6 +1905,7 @@ body{font-family:Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}.car
 </style></head><body>
 <div class="card"><div class="header"><div><h1>Общие настройки</h1><div class="small">Почта, Indigo PostgreSQL, домены пользователей и параметры автоматических напоминаний.</div></div><div class="actions"><a class="link" href="/admin/settings/">Настройки</a><a class="link" href="/">Отчет</a></div></div></div>
 <div class="grid">
+<section class="card wide"><h2>Доступ к отчету</h2><div class="row"><div><label>Разрешить просмотр отчета без авторизации</label><div class="hint">При отключении отчет доступен только пользователям с базовым доступом, правом импорта или правами администратора.</div></div><input id="public-report-enabled" type="checkbox"></div><div class="buttons"><button id="public-report-save" class="primary" type="button">Сохранить</button></div><div id="public-report-message" class="message"></div></section>
 <section class="card wide"><h2>Получение данных о работниках (IMAP)</h2><div id="imap-status" class="status">Загрузка...</div>
 <div class="row"><div><label>Сервер</label></div><input id="imap-host"></div><div class="row"><div><label>Порт</label></div><input id="imap-port" type="number" min="1" max="65535"></div><div class="row"><div><label>Использовать SSL</label></div><input id="imap-ssl" type="checkbox"></div><div class="row"><div><label>Пользователь</label></div><input id="imap-user"></div><div class="row"><div><label>Пароль</label><div class="hint">Пустое поле сохраняет текущий пароль.</div></div><input id="imap-password" type="password" autocomplete="new-password"></div><div class="row"><div><label>Папка</label></div><input id="imap-folder"></div><div class="row"><div><label>Отправитель содержит</label></div><input id="imap-from"></div><div class="row"><div><label>Глубина поиска, дней</label></div><input id="imap-lookback" type="number" min="1" max="365"></div><div class="row"><div><label>Точное имя вложения</label></div><input id="imap-filename"></div><div class="row"><div><label>Время ежедневной проверки</label></div><div style="display:flex;gap:8px"><input id="fetch-hour" type="number" min="0" max="23"><input id="fetch-minute" type="number" min="0" max="59"></div></div><div class="row"><div><label>Часовой пояс</label></div><input id="app-timezone" placeholder="Europe/Moscow"></div><div class="buttons"><button id="imap-test" type="button">Проверить подключение</button><button id="imap-find" type="button">Найти файл сейчас</button><button id="imap-import" type="button">Импортировать сейчас</button><button id="imap-save" class="primary" type="button">Сохранить и проверить</button></div><div id="imap-message" class="message"></div></section>
 <section class="card"><h2>SMTP</h2><div id="smtp-status" class="status">Загрузка...</div>
