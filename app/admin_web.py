@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from ldap3 import ALL, SUBTREE, Connection, Server, Tls
-from ldap3.core.exceptions import LDAPException
+from ldap3.core.exceptions import LDAPException, LDAPInvalidCredentialsResult
 from openpyxl import Workbook
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -530,12 +530,27 @@ def _ad_bool(key: str, default: str = "0") -> bool:
     return _read_setting(key, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _ad_short_login(login: str) -> str:
+    """Возвращает короткий sAMAccountName независимо от формы ввода."""
+    value = login.strip()
+    if "\\" in value:
+        value = value.rsplit("\\", 1)[-1]
+    if "@" in value:
+        value = value.split("@", 1)[0]
+    return value.strip()
+
+
 def _ad_bind_name(login: str) -> str:
-    login = login.strip()
-    domain = _read_setting("ad_domain", "").strip()
-    if "\\" in login or "@" in login or not domain:
-        return login
-    return f"{domain}\\{login}"
+    """Формирует имя для LDAP bind. Короткий логин дополняется NetBIOS-доменом."""
+    value = login.strip()
+    if not value:
+        raise RuntimeError("Не указан логин Active Directory")
+    if "\\" in value or "@" in value:
+        return value
+    netbios_domain = _read_setting("ad_domain", "").strip()
+    if not netbios_domain:
+        raise RuntimeError("В настройках Active Directory не указан домен NetBIOS")
+    return f"{netbios_domain}\\{value}"
 
 
 def _ad_server() -> Server:
@@ -555,7 +570,7 @@ def _ad_search_connection() -> Connection:
 
 
 def _ad_find_user(login: str, connection: Connection | None = None) -> dict:
-    clean_login = login.strip().split("\\")[-1].split("@")[0]
+    clean_login = _ad_short_login(login)
     if not clean_login:
         raise RuntimeError("Не указан логин Active Directory")
     base_dn = _read_setting("ad_base_dn", "").strip()
@@ -590,9 +605,14 @@ def _ad_authenticate(login: str, password: str) -> dict:
         raise RuntimeError("Авторизация через Active Directory отключена")
     if not password:
         raise RuntimeError("Не указан пароль")
-    conn = Connection(_ad_server(), user=_ad_bind_name(login), password=password, auto_bind=True, raise_exceptions=True)
+    short_login = _ad_short_login(login)
+    bind_name = _ad_bind_name(login)
     try:
-        return _ad_find_user(login, conn)
+        conn = Connection(_ad_server(), user=bind_name, password=password, auto_bind=True, raise_exceptions=True)
+    except LDAPInvalidCredentialsResult as error:
+        raise RuntimeError("Неверный логин или пароль") from error
+    try:
+        return _ad_find_user(short_login, conn)
     finally:
         conn.unbind()
 
@@ -604,7 +624,7 @@ def _ad_is_domain_admin(user: dict) -> bool:
     return any((f"cn={group}," in value.casefold()) or value.casefold() == group for value in user.get("groups", []))
 
 
-LOGIN_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход</title><style>body{font-family:Arial,sans-serif;margin:0;background:#f5f6f8;color:#222;min-height:100vh;display:grid;place-items:center}.card{width:min(420px,calc(100% - 32px));background:#fff;border-radius:12px;padding:24px;box-sizing:border-box;box-shadow:0 2px 12px rgba(0,0,0,.12)}h1{margin:0 0 8px;font-size:24px}.small{margin:0 0 20px;color:#667085;font-size:13px;line-height:1.45}label{display:block;margin:14px 0 6px;font-size:13px;font-weight:600}input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #98a2b3;border-radius:7px;font-size:14px}.button{width:100%;margin-top:18px;padding:10px 14px;border:1px solid #175cd3;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.error{margin-top:14px;padding:10px 12px;border-radius:7px;background:#fef3f2;color:#b42318;font-size:13px}.back{display:block;margin-top:14px;text-align:center;color:#475467;text-decoration:none;font-size:13px}</style></head><body><main class="card"><h1>Вход</h1><p class="small">Используйте доменную учетную запись. Аварийная учетная запись администратора из .env также доступна.</p><form method="post" action="/login"><input type="hidden" name="next" value="__NEXT__"><label for="username">Логин</label><input id="username" name="username" autocomplete="username" required autofocus><label for="password">Пароль</label><input id="password" name="password" type="password" autocomplete="current-password" required><button class="button" type="submit">Войти</button></form>__ERROR__<a class="back" href="/">Вернуться к отчету</a></main></body></html>"""
+LOGIN_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход</title><style>body{font-family:Arial,sans-serif;margin:0;background:#f5f6f8;color:#222;min-height:100vh;display:grid;place-items:center}.card{width:min(420px,calc(100% - 32px));background:#fff;border-radius:12px;padding:24px;box-sizing:border-box;box-shadow:0 2px 12px rgba(0,0,0,.12)}h1{margin:0 0 8px;font-size:24px}.small{margin:0 0 20px;color:#667085;font-size:13px;line-height:1.45}label{display:block;margin:14px 0 6px;font-size:13px;font-weight:600}input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #98a2b3;border-radius:7px;font-size:14px}.button{width:100%;margin-top:18px;padding:10px 14px;border:1px solid #175cd3;border-radius:7px;background:#175cd3;color:#fff;font-weight:600;cursor:pointer}.error{margin-top:14px;padding:10px 12px;border-radius:7px;background:#fef3f2;color:#b42318;font-size:13px}.back{display:block;margin-top:14px;text-align:center;color:#475467;text-decoration:none;font-size:13px}</style></head><body><main class="card"><h1>Вход</h1><p class="small">Используйте доменную учетную запись. Аварийная учетная запись администратора из .env также доступна.</p><form method="post" action="/login"><input type="hidden" name="next" value="__NEXT__"><label for="username">Логин</label><input id="username" name="username" autocomplete="username" placeholder="ivanov.ii" required autofocus><label for="password">Пароль</label><input id="password" name="password" type="password" autocomplete="current-password" required><button class="button" type="submit">Войти</button></form>__ERROR__<a class="back" href="/">Вернуться к отчету</a></main></body></html>"""
 
 
 def _login_html(next_url: str, error: str = "") -> str:
@@ -648,7 +668,7 @@ def login_submit(request: Request, username: Annotated[str, Form()], password: A
         request.session["ad_domain_admin"] = domain_admin
         return RedirectResponse(_safe_next(next), status_code=status.HTTP_303_SEE_OTHER)
     except (LDAPException, RuntimeError, ValueError) as error:
-        return HTMLResponse(_login_html(next, f"Не удалось выполнить вход: {error}"), status_code=401)
+        return HTMLResponse(_login_html(next, str(error)), status_code=401)
 
 
 @app.get("/api/auth/me")
