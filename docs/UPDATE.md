@@ -72,3 +72,8 @@ mv /opt/invite-mailer-storage.backup-ДАТА /opt/invite-mailer-storage
 ```bash
 docker compose up -d --build
 ```
+
+
+## После обновления до 2.3.11
+
+Откройте «Настройки» – «Общие настройки» и проверьте блок получения данных по IMAP. При первом запуске версии существующие значения переносятся в SQLite. После проверки можно удалить устаревшие файлы `README_UPDATE.md` и `README_INDIGO_UPDATE.md`.

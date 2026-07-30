@@ -21,7 +21,7 @@ from .logic import (
     send_notifications,
 )
 from .settings import load_settings
-from .runtime_settings import bootstrap_runtime_settings
+from .runtime_settings import apply_runtime_settings, bootstrap_runtime_settings
 from .reminders import process_reminders
 from .technical_alerts import dispatch_technical_error_digest
 
@@ -104,7 +104,30 @@ def scheduler_mode(settings, db: Database) -> None:
 
     def fetch_job():
         try:
+            # Планировщик работает в отдельном процессе, поэтому перед проверкой
+            # перечитывает изменяемые через Web параметры из SQLite.
+            apply_runtime_settings(settings, db)
+            with db.connect() as connection:
+                values = {row["key"]: row["value"] for row in connection.execute(
+                    "SELECT key,value FROM app_settings WHERE key IN "
+                    "('fetch_hour','fetch_minute','app_timezone','fetch_last_auto_run')"
+                ).fetchall()}
+            tz_name = values.get("app_timezone", timezone) or timezone
+            local_now = datetime.now(ZoneInfo(tz_name))
+            today = local_now.date().isoformat()
+            hour = int(values.get("fetch_hour", "8"))
+            minute = int(values.get("fetch_minute", "30"))
+            if (local_now.hour, local_now.minute) < (hour, minute):
+                return
+            if values.get("fetch_last_auto_run") == today:
+                return
             path = fetch_and_import(settings, db)
+            with db.connect() as connection:
+                connection.execute(
+                    "INSERT INTO app_settings(key,value,updated_at) VALUES('fetch_last_auto_run',?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    (today, local_now.isoformat()),
+                )
             rebuild_report(settings, db, sync_indigo=False)
             LOGGER.info("XLSX обработан: %s", path)
         except Exception:
@@ -193,14 +216,11 @@ def scheduler_mode(settings, db: Database) -> None:
 
     scheduler.add_job(
         fetch_job,
-        CronTrigger(
-            hour=int(schedule["fetch_hour"]),
-            minute=int(schedule["fetch_minute"]),
-            timezone=timezone,
-        ),
+        CronTrigger(minute="*", timezone=timezone),
         id="daily_fetch",
         replace_existing=True,
         max_instances=1,
+        coalesce=True,
     )
     scheduler.add_job(
         send_job,

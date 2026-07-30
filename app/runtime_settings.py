@@ -4,16 +4,28 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .db import Database
-from .settings import IndigoSettings, Settings, SmtpSettings
+from .settings import ImapSettings, IndigoSettings, Settings, SmtpSettings
 
 
-BOOTSTRAP_VERSION = "3"
+BOOTSTRAP_VERSION = "4"
 
 # Эти значения используются только тогда, когда SQLite уже был инициализирован,
 # но отдельный ключ по какой-либо причине отсутствует. Переменные окружения в
 # таком случае намеренно не используются: после первичного импорта источником
 # рабочих настроек является только SQLite.
 RUNTIME_DEFAULTS: dict[str, str] = {
+    "imap_host": "",
+    "imap_port": "993",
+    "imap_ssl": "1",
+    "imap_username": "",
+    "imap_password": "",
+    "imap_folder": "INBOX",
+    "imap_from_contains": "1c-robot@",
+    "imap_lookback_days": "3",
+    "imap_attachment_filename": "",
+    "fetch_hour": "8",
+    "fetch_minute": "30",
+    "app_timezone": "Europe/Moscow",
     "smtp_host": "",
     "smtp_port": "465",
     "smtp_mode": "ssl",
@@ -71,6 +83,18 @@ def _initial_values(settings: Settings) -> dict[str, str]:
     """Формирует значения только для самого первого импорта в SQLite."""
     domains = settings.config.get("mail", {}).get("allowed_domains", [])
     return {
+        "imap_host": settings.imap.host,
+        "imap_port": str(settings.imap.port),
+        "imap_ssl": "1" if settings.imap.ssl else "0",
+        "imap_username": settings.imap.username,
+        "imap_password": settings.imap.password,
+        "imap_folder": settings.imap.folder,
+        "imap_from_contains": settings.imap.from_contains,
+        "imap_lookback_days": str(settings.imap.lookback_days),
+        "imap_attachment_filename": str(settings.config.get("source", {}).get("attachment_filename", "")),
+        "fetch_hour": str(settings.config.get("schedule", {}).get("fetch_hour", 8)),
+        "fetch_minute": str(settings.config.get("schedule", {}).get("fetch_minute", 30)),
+        "app_timezone": str(settings.config.get("app", {}).get("timezone", "Europe/Moscow")),
         "smtp_host": settings.smtp.host,
         "smtp_port": str(settings.smtp.port),
         "smtp_mode": settings.smtp.mode,
@@ -107,14 +131,22 @@ def bootstrap_runtime_settings(settings: Settings, db: Database) -> None:
     перезаписать настройки, сохраненные через Web UI.
     """
     current = _read_all(db)
-    bootstrap_done = "integration_settings_bootstrap_version" in current
+    previous_version = current.get("integration_settings_bootstrap_version", "")
 
-    if not bootstrap_done:
+    if not previous_version:
         # Самый первый запуск: переносим существующую конфигурацию установки.
         _insert_missing(db, _initial_values(settings))
     else:
-        # Обновление существующей установки: добавляем только безопасные
-        # значения по умолчанию, не читая SMTP/Indigo из окружения повторно.
+        # При обновлении не импортируем уже перенесенные SMTP/Indigo повторно.
+        if previous_version != BOOTSTRAP_VERSION:
+            # v4 впервые переносит IMAP, имя XLSX и расписание получения.
+            initial = _initial_values(settings)
+            _insert_missing(db, {key: initial[key] for key in (
+                "imap_host", "imap_port", "imap_ssl", "imap_username",
+                "imap_password", "imap_folder", "imap_from_contains",
+                "imap_lookback_days", "imap_attachment_filename",
+                "fetch_hour", "fetch_minute", "app_timezone",
+            )})
         _insert_missing(db, RUNTIME_DEFAULTS)
 
     _save_bootstrap_version(db)
@@ -132,6 +164,25 @@ def _int_value(values: dict[str, str], key: str) -> int:
 def apply_runtime_settings(settings: Settings, db: Database) -> None:
     """Применяет рабочие настройки из SQLite без fallback к .env."""
     values = _read_all(db)
+
+    imap = ImapSettings(
+        host=values.get("imap_host", RUNTIME_DEFAULTS["imap_host"]).strip(),
+        port=_int_value(values, "imap_port"),
+        ssl=values.get("imap_ssl", RUNTIME_DEFAULTS["imap_ssl"]) == "1",
+        username=values.get("imap_username", RUNTIME_DEFAULTS["imap_username"]).strip(),
+        password=values.get("imap_password", RUNTIME_DEFAULTS["imap_password"]),
+        folder=values.get("imap_folder", RUNTIME_DEFAULTS["imap_folder"]).strip() or "INBOX",
+        from_contains=values.get("imap_from_contains", RUNTIME_DEFAULTS["imap_from_contains"]).strip(),
+        lookback_days=_int_value(values, "imap_lookback_days"),
+    )
+    settings.config.setdefault("source", {})["attachment_filename"] = values.get(
+        "imap_attachment_filename", RUNTIME_DEFAULTS["imap_attachment_filename"]
+    ).strip()
+    settings.config.setdefault("schedule", {})["fetch_hour"] = _int_value(values, "fetch_hour")
+    settings.config["schedule"]["fetch_minute"] = _int_value(values, "fetch_minute")
+    settings.config.setdefault("app", {})["timezone"] = values.get(
+        "app_timezone", RUNTIME_DEFAULTS["app_timezone"]
+    ).strip() or "Europe/Moscow"
 
     smtp = SmtpSettings(
         host=values.get("smtp_host", RUNTIME_DEFAULTS["smtp_host"]).strip(),
@@ -164,6 +215,7 @@ def apply_runtime_settings(settings: Settings, db: Database) -> None:
     settings.config["mail"]["validate_domain"] = (
         values.get("validate_domain", RUNTIME_DEFAULTS["validate_domain"]) == "1"
     )
+    object.__setattr__(settings, "imap", imap)
     object.__setattr__(settings, "smtp", smtp)
     object.__setattr__(settings, "indigo", indigo)
 

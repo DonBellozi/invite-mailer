@@ -71,11 +71,26 @@ def _employees_for_template(connection, template: dict):
     ).fetchall()
 
 
-def _render_reminder(settings: Settings, db: Database, template: dict, employee, reminder_number: int) -> tuple[str, str, bool]:
+def _render_reminder(settings: Settings, db: Database, template: dict, employee, reminder_number: int, result) -> tuple[str, str, bool]:
+    result_status = result.status or "not_started"
+    test_failed = result_status == "failed"
+    test_passed = result_status == "completed"
+    reminder_reason = (
+        "Тестирование пройдено, но положительный результат не получен. Необходимо пройти тест повторно."
+        if test_failed
+        else "Тестирование еще не завершено с положительным результатом."
+    )
     context = {
         "fio": employee["fio"], "email": employee["email"], "login": employee["login"],
         "department": employee["department"], "position": employee["position"],
         "reminder_number": reminder_number, "test_name": _template_name(template),
+        "result_status": result_status, "result_grade": result.grade,
+        "result_percent": result.percent, "attempts": result.attempts,
+        "successful_attempts": result.successful_attempts,
+        "failed_attempts": result.failed_attempts,
+        "test_started": result.attempts > 0,
+        "test_completed": test_passed, "test_passed": test_passed,
+        "test_failed": test_failed, "reminder_reason": reminder_reason,
     }
     return render_mail_template(db, "reminder", str(template["id"]), context)
 
@@ -375,7 +390,7 @@ def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -
                     continue
 
                 try:
-                    subject, body, mail_enabled = _render_reminder(settings, db, template, employee, reminder_count + 1)
+                    subject, body, mail_enabled = _render_reminder(settings, db, template, employee, reminder_count + 1, result)
                     if not mail_enabled:
                         summary["skipped"] += 1
                         continue
