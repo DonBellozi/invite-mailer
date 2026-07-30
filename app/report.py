@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import html
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .audience import is_explicit_template
@@ -405,6 +405,109 @@ def _fmt_percent(value: float | None) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".").replace(".", ",")
 
 
+
+
+def _setting(connection, key: str, default: str) -> str:
+    row = connection.execute(
+        "SELECT value FROM app_settings WHERE key = ?",
+        (key,),
+    ).fetchone()
+    return str(row["value"]) if row else default
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _mail_queue_state(
+    connection,
+    employee,
+    template: dict,
+    result: ResultSummary,
+    latest,
+    escalation,
+    now: datetime,
+) -> tuple[bool, str, str]:
+    """Возвращает фактическое наличие письма в ближайшей очереди.
+
+    Очередь не подменяет основной статус работника. Она используется только
+    фильтром «Ожидает отправки» и поясняющими столбцами отчета.
+    """
+    if not employee["active"] or not employee["email"]:
+        return False, "", ""
+    if result.status == "completed" or escalation:
+        return False, "", ""
+
+    template_id = str(template["id"])
+    initial = connection.execute(
+        """
+        SELECT * FROM notification_history
+        WHERE worker_key = ?
+          AND employment_seq = ?
+          AND template_id = ?
+          AND status = 'sent'
+          AND method IN ('automatic', 'manual_seed')
+        ORDER BY sent_at ASC
+        LIMIT 1
+        """,
+        (employee["worker_key"], employee["employment_seq"], template_id),
+    ).fetchone()
+
+    if not initial:
+        retry = bool(latest and str(latest["status"] or "").lower() == "error")
+        action = "Повтор после ошибки" if retry else "Первоначальное приглашение"
+        return True, action, "При ближайшем запуске"
+
+    if _setting(connection, "reminders_enabled", "1") != "1":
+        return False, "", ""
+
+    interval_days = int(_setting(connection, "reminder_interval_days", "7"))
+    max_reminders = int(_setting(connection, "max_reminders", "10"))
+    reminders = connection.execute(
+        """
+        SELECT * FROM notification_history
+        WHERE worker_key = ?
+          AND employment_seq = ?
+          AND template_id = ?
+          AND status = 'sent'
+          AND method = 'reminder'
+        ORDER BY sent_at ASC
+        """,
+        (employee["worker_key"], employee["employment_seq"], template_id),
+    ).fetchall()
+    reminder_count = len(reminders)
+    if reminder_count >= max_reminders:
+        return False, "", ""
+
+    anchor = reminders[-1]["sent_at"] if reminders else initial["sent_at"]
+    anchor_dt = _parse_timestamp(anchor)
+    if anchor_dt is None:
+        return False, "", ""
+    due_at = anchor_dt + timedelta(days=interval_days)
+    if now < due_at:
+        return False, "", ""
+
+    reminder_number = reminder_count + 1
+    retry = bool(
+        latest
+        and str(latest["status"] or "").lower() == "error"
+        and str(latest["method"] or "").lower() == "reminder"
+    )
+    if retry:
+        action = f"Повтор после ошибки – напоминание № {reminder_number}"
+    else:
+        action = f"Напоминание № {reminder_number}"
+    return True, action, _fmt_date(due_at.isoformat())
+
+
 def _department_applies(
     department: str | None,
     template: dict,
@@ -669,6 +772,7 @@ def build_report(
         ]
 
         rows: list[str] = []
+        queue_now = datetime.now(timezone.utc).replace(microsecond=0)
         participant_counts: dict[str, int] = {}
         error_count = 0
 
@@ -727,6 +831,20 @@ def build_report(
                     escalation,
                 )
 
+                (
+                    queued,
+                    queue_action,
+                    queue_date,
+                ) = _mail_queue_state(
+                    connection,
+                    employee,
+                    template,
+                    result,
+                    latest,
+                    escalation,
+                    queue_now,
+                )
+
                 if status_key == "error":
                     error_count += 1
 
@@ -771,17 +889,21 @@ def build_report(
                 )
 
                 has_email = "1" if employee["email"] else "0"
+                queued_value = "1" if queued else "0"
 
                 rows.append(
                     f"<tr "
                     f"data-template-id='{template_id}' "
                     f"data-template-name='{template_name}' "
                     f"data-has-email='{has_email}' "
+                    f"data-queued='{queued_value}' "
                     f"data-status='{escaped_status_key}'>"
                     f"{cells}"
                     f"<td class='{status_class}'>"
                     f"{html.escape(status)}"
                     f"</td>"
+                    f"<td>{html.escape(queue_action)}</td>"
+                    f"<td>{html.escape(queue_date)}</td>"
                     f"<td>{html.escape(grade)}</td>"
                     f"<td>{html.escape(percent)}</td>"
                     f"</tr>"
@@ -1049,6 +1171,8 @@ def build_report(
           <th>Должность</th>
           <th>Тест</th>
           <th>Статус</th>
+          <th>Предстоящая отправка</th>
+          <th>Плановая дата</th>
           <th>Оценка</th>
           <th>Результат, %</th>
         </tr>
@@ -1121,10 +1245,9 @@ function updateTestDashboard() {{
     row => row.dataset.hasEmail === '1'
   );
 
-  const waiting = Math.max(
-    0,
-    participantRows.length - completed - failed
-  );
+  const waiting = testRows.filter(
+    row => row.dataset.queued === '1'
+  ).length;
 
   document.getElementById(
     'test-dashboard-title'
@@ -1200,7 +1323,11 @@ function applyFilters() {{
 
     const matchesStatus =
       !status
-      || row.dataset.status === status;
+      || (
+        status === 'waiting'
+          ? row.dataset.queued === '1'
+          : row.dataset.status === status
+      );
 
     row.hidden = !(
       matchesText
