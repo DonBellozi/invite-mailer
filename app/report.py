@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import html
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 from .audience import is_explicit_template
@@ -320,6 +320,10 @@ th {
   color: #a21d1d;
 }
 
+.result-column-hidden {
+  display: none;
+}
+
 .hidden {
   display: none !important;
 }
@@ -505,6 +509,146 @@ def _mail_queue_state(
         action = f"Напоминание № {reminder_number}"
     return True, action, _fmt_date(due_at.isoformat())
 
+
+
+def _first_setting(
+    connection,
+    keys: tuple[str, ...],
+) -> str | None:
+    for key in keys:
+        row = connection.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            continue
+        value = str(row["value"] or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _parse_weekday(value: str | None) -> int | None:
+    if value is None:
+        return None
+
+    normalized = value.strip().lower()
+    names = {
+        "monday": 0,
+        "mon": 0,
+        "понедельник": 0,
+        "пн": 0,
+        "tuesday": 1,
+        "tue": 1,
+        "вторник": 1,
+        "вт": 1,
+        "wednesday": 2,
+        "wed": 2,
+        "среда": 2,
+        "ср": 2,
+        "thursday": 3,
+        "thu": 3,
+        "четверг": 3,
+        "чт": 3,
+        "friday": 4,
+        "fri": 4,
+        "пятница": 4,
+        "пт": 4,
+        "saturday": 5,
+        "sat": 5,
+        "суббота": 5,
+        "сб": 5,
+        "sunday": 6,
+        "sun": 6,
+        "воскресенье": 6,
+        "вс": 6,
+    }
+    if normalized in names:
+        return names[normalized]
+
+    try:
+        number = int(normalized)
+    except ValueError:
+        return None
+
+    if 0 <= number <= 6:
+        return number
+    if 1 <= number <= 7:
+        return number - 1
+    return None
+
+
+def _parse_send_time(value: str | None) -> time | None:
+    if not value:
+        return None
+
+    for pattern in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(value.strip(), pattern).time()
+        except ValueError:
+            continue
+    return None
+
+
+def _next_automatic_send_text(connection) -> str:
+    enabled_value = _first_setting(
+        connection,
+        (
+            "automatic_sending_enabled",
+            "automatic_send_enabled",
+            "auto_send_enabled",
+            "mailing_enabled",
+        ),
+    )
+    if enabled_value is not None and enabled_value.lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "нет",
+    }:
+        return "автоматическая отправка отключена"
+
+    weekday_value = _first_setting(
+        connection,
+        (
+            "automatic_send_weekday",
+            "automatic_send_day",
+            "auto_send_weekday",
+            "auto_send_day",
+            "send_weekday",
+            "send_day",
+            "mailing_weekday",
+            "mailing_day",
+        ),
+    )
+    time_value = _first_setting(
+        connection,
+        (
+            "automatic_send_time",
+            "auto_send_time",
+            "send_time",
+            "mailing_time",
+        ),
+    )
+
+    weekday = _parse_weekday(weekday_value)
+    send_time = _parse_send_time(time_value)
+    if weekday is None or send_time is None:
+        return "не настроена"
+
+    now = datetime.now().astimezone().replace(microsecond=0)
+    days_ahead = (weekday - now.weekday()) % 7
+    candidate_date = (now + timedelta(days=days_ahead)).date()
+    candidate = datetime.combine(
+        candidate_date,
+        send_time,
+        tzinfo=now.tzinfo,
+    )
+    if candidate <= now:
+        candidate += timedelta(days=7)
+
+    return candidate.strftime("%d.%m.%Y %H:%M")
 
 def _department_applies(
     department: str | None,
@@ -741,6 +885,10 @@ def build_report(
             """
         ).fetchone()
 
+        next_automatic_send_text = _next_automatic_send_text(
+            connection,
+        )
+
         history_template_ids = {
             row["template_id"]
             for row in connection.execute(
@@ -919,8 +1067,8 @@ def build_report(
                     f"<td class='{status_class}'>"
                     f"{html.escape(status)}"
                     f"</td>"
-                    f"<td>{html.escape(grade)}</td>"
-                    f"<td>{html.escape(percent)}</td>"
+                    f"<td class='result-grade-column'>{html.escape(grade)}</td>"
+                    f"<td class='result-percent-column'>{html.escape(percent)}</td>"
                     f"</tr>"
                 )
 
@@ -1043,6 +1191,8 @@ def build_report(
         Импорт: {html.escape(import_text)}
         <span class="meta-separator">|</span>
         Результаты Indigo: {indigo_text}
+        <span class="meta-separator">|</span>
+        Следующая автоматическая отправка: {html.escape(next_automatic_send_text)}
       </p>
     </section>
 
@@ -1186,8 +1336,8 @@ def build_report(
           <th>Должность</th>
           <th>Тест</th>
           <th>Статус</th>
-          <th>Оценка</th>
-          <th>Результат, %</th>
+          <th class="result-grade-column">Оценка</th>
+          <th class="result-percent-column">Результат, %</th>
         </tr>
       </thead>
 
@@ -1228,6 +1378,33 @@ const exportXlsx =
 
 const exportPdf =
   document.getElementById('export-pdf');
+
+const resultColumns = [
+  ...document.querySelectorAll(
+    '.result-grade-column, .result-percent-column'
+  )
+];
+
+const statusesWithoutResults = new Set([
+  'ignoring',
+  'sent',
+  'waiting',
+  'error',
+  'no_email'
+]);
+
+function updateResultColumns() {{
+  const hide = statusesWithoutResults.has(
+    statusFilter.value
+  );
+
+  resultColumns.forEach(column => {{
+    column.classList.toggle(
+      'result-column-hidden',
+      hide
+    );
+  }});
+}}
   
 function updateTestDashboard() {{
   const templateId = testFilter.value;
@@ -1358,6 +1535,7 @@ function applyFilters() {{
 
   updateTestDashboard();
   updateErrorMetricState();
+  updateResultColumns();
 }}
 
 
