@@ -216,6 +216,10 @@ h2.dashboard-title {
   white-space: nowrap;
 }
 
+.dashboard-next-send {
+  margin-top: 5px;
+}
+
 .meta-separator {
   margin: 0 7px;
   color: #98a2b3;
@@ -594,6 +598,7 @@ def _next_automatic_send_text(connection) -> str:
     enabled_value = _first_setting(
         connection,
         (
+            "reminders_enabled",
             "automatic_sending_enabled",
             "automatic_send_enabled",
             "auto_send_enabled",
@@ -612,6 +617,7 @@ def _next_automatic_send_text(connection) -> str:
     weekday_value = _first_setting(
         connection,
         (
+            "reminder_run_day_of_week",
             "automatic_send_weekday",
             "automatic_send_day",
             "auto_send_weekday",
@@ -631,6 +637,19 @@ def _next_automatic_send_text(connection) -> str:
             "mailing_time",
         ),
     )
+
+    # В актуальных настройках час и минуты хранятся отдельно.
+    if time_value is None:
+        hour_value = _first_setting(connection, ("reminder_run_hour",))
+        minute_value = _first_setting(connection, ("reminder_run_minute",))
+        if hour_value is not None and minute_value is not None:
+            try:
+                hour = int(hour_value)
+                minute = int(minute_value)
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    time_value = f"{hour:02d}:{minute:02d}"
+            except (TypeError, ValueError):
+                pass
 
     weekday = _parse_weekday(weekday_value)
     send_time = _parse_send_time(time_value)
@@ -1187,13 +1206,16 @@ def build_report(
         </button>
       </div>
 
-      <p class="small dashboard-meta">
-        Импорт: {html.escape(import_text)}
-        <span class="meta-separator">|</span>
-        Результаты Indigo: {indigo_text}
-        <span class="meta-separator">|</span>
-        Следующая автоматическая отправка: {html.escape(next_automatic_send_text)}
-      </p>
+      <div class="small dashboard-meta">
+        <div>
+          Импорт: {html.escape(import_text)}
+          <span class="meta-separator">|</span>
+          Результаты Indigo: {indigo_text}
+        </div>
+        <div class="dashboard-next-send">
+          Следующая автоматическая отправка: {html.escape(next_automatic_send_text)}
+        </div>
+      </div>
     </section>
 
     <section
