@@ -157,6 +157,24 @@ CREATE TABLE IF NOT EXISTS app_settings (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS exclusions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK(kind IN ('employee', 'position')),
+    fio TEXT,
+    position TEXT NOT NULL,
+    normalized_fio TEXT NOT NULL DEFAULT '',
+    normalized_position TEXT NOT NULL,
+    template_id TEXT NOT NULL DEFAULT '*',
+    reason TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(kind, normalized_fio, normalized_position, template_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exclusions_lookup
+ON exclusions(enabled, template_id, kind, normalized_fio, normalized_position);
+
 CREATE TABLE IF NOT EXISTS app_users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     login TEXT NOT NULL UNIQUE COLLATE NOCASE,

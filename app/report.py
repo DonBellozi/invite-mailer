@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .audience import is_explicit_template
 from .db import Database
+from .exclusions import is_employee_excluded, is_employee_globally_excluded
 from .indigo import ResultSummary, summarize_employee_result
 
 
@@ -811,7 +812,7 @@ def _report_employees(
     template: dict,
 ):
     if is_explicit_template(template):
-        return connection.execute(
+        employees = connection.execute(
             """
             SELECT e.*
             FROM test_assignments a
@@ -825,6 +826,7 @@ def _report_employees(
             """,
             (template["id"],),
         ).fetchall()
+        return [employee for employee in employees if not is_employee_excluded(connection, employee, str(template["id"]))]
 
     employees = connection.execute(
         """
@@ -842,6 +844,7 @@ def _report_employees(
             employee["department"],
             template,
         )
+        and not is_employee_excluded(connection, employee, str(template["id"]))
     ]
 
 
@@ -858,13 +861,9 @@ def build_report(
     )
 
     with db.connect() as connection:
-        employee_count = connection.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM employees
-            WHERE active = 1
-            """
-        ).fetchone()["count"]
+        active_employees = connection.execute("SELECT * FROM employees WHERE active = 1").fetchall()
+        globally_visible_employees = [employee for employee in active_employees if not is_employee_globally_excluded(connection, employee)]
+        employee_count = len(globally_visible_employees)
 
         last_import = connection.execute(
             """
@@ -876,17 +875,7 @@ def build_report(
             """
         ).fetchone()
 
-        missing_email = connection.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM employees
-            WHERE active = 1
-              AND (
-                    email IS NULL
-                    OR email = ''
-                  )
-            """
-        ).fetchone()["count"]
+        missing_email = sum(1 for employee in globally_visible_employees if not (employee["email"] or "").strip())
 
         indigo_last_sync = connection.execute(
             """
