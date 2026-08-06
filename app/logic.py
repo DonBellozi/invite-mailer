@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fnmatch
 import shutil
 import time
 from datetime import datetime, timedelta
@@ -12,28 +11,19 @@ from .audience import is_explicit_template
 from .db import Database
 from .imap_source import fetch_latest_attachment
 from .mailer import send_html_email
+from .placements import eligible_placements, placement_columns
 from .report import build_report
 from .exclusions import is_employee_excluded
 from .settings import Settings
-from .xlsx_parser import EmployeeRecord, parse_xlsx
+from .xlsx_parser import EmployeePlacementRecord, EmployeeRecord, parse_xlsx
 
 
 def now_iso() -> str:
     return datetime.now().replace(microsecond=0).isoformat()
 
 
-def _department_matches(department: str | None, rule: dict) -> bool:
-    value = (department or "").lower()
-    includes = rule.get("include") or ["*"]
-    excludes = rule.get("exclude") or []
-
-    included = any(fnmatch.fnmatch(value, str(pattern).lower()) for pattern in includes)
-    excluded = any(fnmatch.fnmatch(value, str(pattern).lower()) for pattern in excludes)
-    return included and not excluded
-
-
 def _candidate_employees(connection, template: dict):
-    """Возвращает только сотрудников, которым применим конкретный шаблон."""
+    """Возвращает уникальных работников, которым применим конкретный шаблон."""
     if is_explicit_template(template):
         employees = connection.execute(
             """
@@ -49,19 +39,15 @@ def _candidate_employees(connection, template: dict):
             """,
             (template["id"],),
         ).fetchall()
-        return [
-            employee
-            for employee in employees
-            if not is_employee_excluded(connection, employee, str(template["id"]))
-        ]
+    else:
+        employees = connection.execute(
+            "SELECT * FROM employees WHERE active = 1 ORDER BY fio"
+        ).fetchall()
 
-    employees = connection.execute(
-        "SELECT * FROM employees WHERE active = 1 ORDER BY fio"
-    ).fetchall()
     return [
         employee
         for employee in employees
-        if _department_matches(employee["department"], template.get("departments", {}))
+        if eligible_placements(connection, employee, template)
         and not is_employee_excluded(connection, employee, str(template["id"]))
     ]
 
@@ -88,6 +74,53 @@ def _is_due(connection, employee, template: dict, now: datetime) -> bool:
     return last_sent + timedelta(days=validity_days) <= now
 
 
+def _record_placements(record: EmployeeRecord) -> tuple[EmployeePlacementRecord, ...]:
+    placements = tuple(getattr(record, "placements", ()) or ())
+    if placements:
+        return placements
+    return (
+        EmployeePlacementRecord(
+            department=record.department,
+            position=record.position,
+        ),
+    )
+
+
+def _replace_employee_placements(
+    connection,
+    record: EmployeeRecord,
+    employment_seq: int,
+    timestamp: str,
+) -> None:
+    """Полностью заменяет назначения текущего периода данными последнего XLSX."""
+    connection.execute(
+        """
+        DELETE FROM employee_placements
+        WHERE worker_key = ? AND employment_seq = ?
+        """,
+        (record.worker_key, employment_seq),
+    )
+
+    for sort_order, placement in enumerate(_record_placements(record)):
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO employee_placements(
+                worker_key, employment_seq, department, position,
+                sort_order, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.worker_key,
+                employment_seq,
+                placement.department or "",
+                placement.position or "",
+                sort_order,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+
 def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_imports: int) -> None:
     timestamp = now_iso()
     seen = {record.worker_key for record in records}
@@ -99,32 +132,47 @@ def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_
         }
 
         for record in records:
+            placements = _record_placements(record)
+            primary = placements[0]
+            primary_department = primary.department
+            primary_position = primary.position
+
             existing = existing_rows.get(record.worker_key)
             if existing is None:
+                employment_seq = 1
                 connection.execute(
                     """
                     INSERT INTO employees(
                         worker_key, fio, email, login, department, position,
-                        active, employment_seq, first_seen_at, last_seen_at,
-                        missed_imports, inactive_since, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 0, NULL, ?)
+                        active, employment_seq, first_seen_at, employment_started_at,
+                        last_seen_at, missed_imports, inactive_since, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 0, NULL, ?)
                     """,
                     (
                         record.worker_key,
                         record.fio,
                         record.email,
                         record.login,
-                        record.department,
-                        record.position,
+                        primary_department,
+                        primary_position,
+                        employment_seq,
+                        timestamp,
                         timestamp,
                         timestamp,
                         timestamp,
                     ),
                 )
+                _replace_employee_placements(
+                    connection,
+                    record,
+                    employment_seq,
+                    timestamp,
+                )
                 continue
 
-            employment_seq = existing["employment_seq"]
-            if not existing["active"]:
+            employment_seq = int(existing["employment_seq"])
+            reactivated = not bool(existing["active"])
+            if reactivated:
                 employment_seq += 1
 
             connection.execute(
@@ -132,6 +180,7 @@ def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_
                 UPDATE employees SET
                     fio = ?, email = ?, login = ?, department = ?, position = ?,
                     active = 1, employment_seq = ?, last_seen_at = ?,
+                    employment_started_at = CASE WHEN ? THEN ? ELSE employment_started_at END,
                     missed_imports = 0, inactive_since = NULL, updated_at = ?
                 WHERE worker_key = ?
                 """,
@@ -139,13 +188,21 @@ def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_
                     record.fio,
                     record.email,
                     record.login,
-                    record.department,
-                    record.position,
+                    primary_department,
+                    primary_position,
                     employment_seq,
+                    timestamp,
+                    1 if reactivated else 0,
                     timestamp,
                     timestamp,
                     record.worker_key,
                 ),
+            )
+            _replace_employee_placements(
+                connection,
+                record,
+                employment_seq,
+                timestamp,
             )
 
         for key, existing in existing_rows.items():
@@ -202,7 +259,8 @@ def fetch_and_import(settings: Settings, db: Database) -> Path:
     if duplicate:
         if not current_file.exists():
             shutil.copy2(result.saved_path, current_file)
-        # Даже для уже обработанного XLSX заново применяем LOGIN_OVERRIDES_JSON.
+        # Даже для уже обработанного XLSX повторно применяем изменения парсера,
+        # LOGIN_OVERRIDES_JSON и актуальную структуру кадровых назначений.
         records = _parse_employee_file(settings, current_file)
         import_employees(db, records, int(source.get("absence_grace_imports", 1)))
         return current_file
@@ -332,12 +390,17 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
                     continue
 
                 try:
+                    placements = eligible_placements(connection, employee, template)
+                    department, position = placement_columns(
+                        placements,
+                        separator="; ",
+                    )
                     body = environment.get_template(template["body_template"]).render(
                         fio=employee["fio"],
                         email=email_address,
                         login=employee["login"],
-                        department=employee["department"],
-                        position=employee["position"],
+                        department=department,
+                        position=position,
                     )
                     send_html_email(
                         settings.smtp,

@@ -48,6 +48,25 @@ ON employees(email, active);
 CREATE INDEX IF NOT EXISTS idx_employees_login
 ON employees(login, active);
 
+CREATE TABLE IF NOT EXISTS employee_placements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_key TEXT NOT NULL,
+    employment_seq INTEGER NOT NULL,
+    department TEXT NOT NULL DEFAULT '',
+    position TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(worker_key) REFERENCES employees(worker_key) ON DELETE CASCADE,
+    UNIQUE(worker_key, employment_seq, department, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_employee_placements_worker
+ON employee_placements(worker_key, employment_seq, sort_order);
+
+CREATE INDEX IF NOT EXISTS idx_employee_placements_department
+ON employee_placements(department, position);
+
 CREATE TABLE IF NOT EXISTS notification_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     worker_key TEXT NOT NULL,
@@ -150,7 +169,6 @@ CREATE TABLE IF NOT EXISTS login_overrides (
 CREATE INDEX IF NOT EXISTS idx_login_overrides_login
 ON login_overrides(login);
 
-
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -203,7 +221,6 @@ CREATE TABLE IF NOT EXISTS reviewer_templates (
     PRIMARY KEY(reviewer_id, template_id),
     FOREIGN KEY(reviewer_id) REFERENCES reviewers(id) ON DELETE CASCADE
 );
-
 
 CREATE TABLE IF NOT EXISTS test_definitions (
     id TEXT PRIMARY KEY,
@@ -284,7 +301,6 @@ CREATE TABLE IF NOT EXISTS reviewer_delivery_attempts (
 
 CREATE INDEX IF NOT EXISTS idx_reviewer_delivery_queue
 ON reviewer_delivery_attempts(queue_id, reviewer_id, status);
-
 
 CREATE TABLE IF NOT EXISTS mail_templates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -373,6 +389,32 @@ class Database:
             UPDATE employees
             SET employment_started_at = first_seen_at
             WHERE employment_started_at IS NULL OR employment_started_at = ''
+            """
+        )
+
+        # При первом запуске новой версии переносим прежние одиночные значения
+        # в таблицу назначений. Полный список будет заменен очередным импортом XLSX.
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO employee_placements(
+                worker_key, employment_seq, department, position,
+                sort_order, created_at, updated_at
+            )
+            SELECT
+                e.worker_key,
+                e.employment_seq,
+                COALESCE(e.department, ''),
+                COALESCE(e.position, ''),
+                0,
+                COALESCE(NULLIF(e.first_seen_at, ''), e.updated_at),
+                e.updated_at
+            FROM employees e
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM employee_placements p
+                WHERE p.worker_key = e.worker_key
+                  AND p.employment_seq = e.employment_seq
+            )
             """
         )
 

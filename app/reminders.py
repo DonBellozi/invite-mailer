@@ -2,16 +2,13 @@ from __future__ import annotations
 
 import html
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
-from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from .db import Database
 from .indigo import summarize_employee_result, try_sync_indigo_results
 from .mailer import send_html_email
 from .mail_templates import ensure_mail_templates, render_mail_template
+from .placements import eligible_placements, placement_columns
 from .settings import Settings
 from .test_catalog import load_test_definitions
 from .technical_alerts import notify_technical_error
@@ -32,9 +29,25 @@ def _template_name(template: dict) -> str:
     return str(template.get("name") or template["id"])
 
 
-def _journal(connection, *, event_type: str, employee, template: dict, status: str,
-             reminder_number: int | None = None, recipient: str | None = None,
-             details: str | None = None) -> None:
+def _placement_values(connection, employee, template: dict) -> tuple[str, str]:
+    return placement_columns(
+        eligible_placements(connection, employee, template),
+        separator="; ",
+    )
+
+
+def _journal(
+    connection,
+    *,
+    event_type: str,
+    employee,
+    template: dict,
+    status: str,
+    reminder_number: int | None = None,
+    recipient: str | None = None,
+    details: str | None = None,
+) -> None:
+    department, position = _placement_values(connection, employee, template)
     connection.execute(
         """
         INSERT INTO notification_journal(
@@ -45,7 +58,7 @@ def _journal(connection, *, event_type: str, employee, template: dict, status: s
         """,
         (
             utc_now().isoformat(), event_type, employee["worker_key"], employee["employment_seq"],
-            employee["fio"], employee["email"], employee["department"], employee["position"],
+            employee["fio"], employee["email"], department, position,
             str(template["id"]), _template_name(template), reminder_number, recipient, status, details,
         ),
     )
@@ -54,7 +67,7 @@ def _journal(connection, *, event_type: str, employee, template: dict, status: s
 def _employees_for_template(connection, template: dict):
     audience = template.get("audience") or {}
     if audience.get("type") == "explicit_list":
-        return connection.execute(
+        employees = connection.execute(
             """
             SELECT e.* FROM test_assignments a
             JOIN employees e ON e.worker_key = a.worker_key AND e.employment_seq = a.employment_seq
@@ -63,15 +76,16 @@ def _employees_for_template(connection, template: dict):
             """,
             (str(template["id"]),),
         ).fetchall()
+    else:
+        # Для обычных шаблонов начальное приглашение является источником истины,
+        # но актуальные назначения и исключения все равно перепроверяются.
+        employees = connection.execute(
+            "SELECT * FROM employees WHERE active = 1 ORDER BY fio"
+        ).fetchall()
+    return [employee for employee in employees if eligible_placements(connection, employee, template)]
 
-    # Для обычных шаблонов начальное приглашение уже является источником истины:
-    # напоминания рассматривают только работников с успешной записью отправки.
-    return connection.execute(
-        "SELECT * FROM employees WHERE active = 1 ORDER BY fio"
-    ).fetchall()
 
-
-def _render_reminder(settings: Settings, db: Database, template: dict, employee, reminder_number: int, result) -> tuple[str, str, bool]:
+def _render_reminder(settings: Settings, db: Database, connection, template: dict, employee, reminder_number: int, result) -> tuple[str, str, bool]:
     result_status = result.status or "not_started"
     test_failed = result_status == "failed"
     test_passed = result_status == "completed"
@@ -80,9 +94,10 @@ def _render_reminder(settings: Settings, db: Database, template: dict, employee,
         if test_failed
         else "Тестирование еще не завершено с положительным результатом."
     )
+    department, position = _placement_values(connection, employee, template)
     context = {
         "fio": employee["fio"], "email": employee["email"], "login": employee["login"],
-        "department": employee["department"], "position": employee["position"],
+        "department": department, "position": position,
         "reminder_number": reminder_number, "test_name": _template_name(template),
         "result_status": result_status, "result_grade": result.grade,
         "result_percent": result.percent, "attempts": result.attempts,
@@ -97,6 +112,7 @@ def _render_reminder(settings: Settings, db: Database, template: dict, employee,
 
 def _create_queue_item(connection, employee, template: dict, reminder_count: int,
                        first_reminder_at: str | None, last_reminder_at: str | None) -> None:
+    department, position = _placement_values(connection, employee, template)
     connection.execute(
         """
         INSERT OR IGNORE INTO reviewer_notification_queue(
@@ -107,7 +123,7 @@ def _create_queue_item(connection, employee, template: dict, reminder_count: int
         """,
         (
             employee["worker_key"], employee["employment_seq"], str(template["id"]),
-            employee["fio"], employee["email"], employee["department"], employee["position"],
+            employee["fio"], employee["email"], department, position,
             reminder_count, first_reminder_at, last_reminder_at, utc_now().isoformat(),
         ),
     )
@@ -129,7 +145,7 @@ def _reviewer_body(row, template_name: str) -> str:
 
 def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                                               template_ids: set[str] | None = None) -> dict:
-    """Отправляет контролирующим сводные письма по тесту с несколькими работниками."""
+    """Отправляет контролирующим сводные письма по тесту с уникальными работниками."""
     settings.templates[:] = load_test_definitions(settings, db)
     ensure_mail_templates(db, settings.templates)
     templates = {str(t["id"]): t for t in settings.templates}
@@ -165,7 +181,6 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                 """,
                 (template_id,),
             ).fetchall()
-
             if not reviewers:
                 summary["pending"] += len(rows)
                 continue
@@ -175,22 +190,18 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                 for row in rows:
                     previous = connection.execute(
                         """SELECT 1 FROM reviewer_delivery_attempts
-                           WHERE queue_id = ? AND reviewer_id = ? AND status = 'sent'
-                           LIMIT 1""",
+                           WHERE queue_id = ? AND reviewer_id = ? AND status = 'sent' LIMIT 1""",
                         (row["id"], reviewer["id"]),
                     ).fetchone()
                     if not previous:
                         unsent_rows.append(row)
-
                 if not unsent_rows:
                     continue
 
                 employees = [
                     {
-                        "fio": row["fio"] or "Не указано",
-                        "email": row["email"] or "Не указан",
-                        "department": row["department"] or "Не указано",
-                        "position": row["position"] or "Не указана",
+                        "fio": row["fio"] or "Не указано", "email": row["email"] or "Не указан",
+                        "department": row["department"] or "Не указано", "position": row["position"] or "Не указана",
                         "reminder_count": int(row["reminder_count"] or 0),
                         "first_reminder_at": row["first_reminder_at"] or "Не указано",
                         "first_invited_at": row["first_reminder_at"] or "Не указано",
@@ -200,11 +211,8 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                 ]
                 first = employees[0]
                 context = {
-                    **first,
-                    "test_name": _template_name(template),
-                    "reviewer_name": reviewer["name"],
-                    "employees": employees,
-                    "employees_count": len(employees),
+                    **first, "test_name": _template_name(template), "reviewer_name": reviewer["name"],
+                    "employees": employees, "employees_count": len(employees),
                     "displayed_employees_count": len(employees),
                 }
 
@@ -213,7 +221,6 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                     if not mail_enabled:
                         summary["pending"] += len(unsent_rows)
                         continue
-
                     send_html_email(settings.smtp, reviewer["email"], subject, body)
                     attempted_at = utc_now().isoformat()
                     for row in unsent_rows:
@@ -242,61 +249,44 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
                     summary["errors"] += len(unsent_rows)
                     connection.commit()
                     notify_technical_error(
-                        settings,
-                        db,
-                        subject="При отправке сообщения обнаружена ошибка",
-                        fio=reviewer["name"],
-                        email_address=reviewer["email"],
-                        error_type="контролирующий не может получить сообщение",
-                        error_text=error_text,
+                        settings, db, subject="При отправке сообщения обнаружена ошибка",
+                        fio=reviewer["name"], email_address=reviewer["email"],
+                        error_type="контролирующий не может получить сообщение", error_text=error_text,
                     )
 
-            # Запись считается доставленной только после успешной отправки всем активным
-            # контролирующим, назначенным на этот тест.
             for row in rows:
                 sent_count = connection.execute(
                     """SELECT COUNT(DISTINCT a.reviewer_id) AS count
                        FROM reviewer_delivery_attempts a
-                       JOIN reviewers r ON r.id = a.reviewer_id AND r.enabled = 1
-                       JOIN reviewer_templates rt
-                         ON rt.reviewer_id = r.id AND rt.template_id = ?
-                       WHERE a.queue_id = ? AND a.status = 'sent'""",
+                       JOIN reviewers r ON r.id=a.reviewer_id AND r.enabled=1
+                       JOIN reviewer_templates rt ON rt.reviewer_id=r.id AND rt.template_id=?
+                       WHERE a.queue_id=? AND a.status='sent'""",
                     (template_id, row["id"]),
                 ).fetchone()["count"]
                 required_count = connection.execute(
-                    """SELECT COUNT(*) AS count
-                       FROM reviewers r
-                       JOIN reviewer_templates rt ON rt.reviewer_id = r.id
-                       WHERE r.enabled = 1 AND rt.template_id = ?""",
+                    """SELECT COUNT(*) AS count FROM reviewers r
+                       JOIN reviewer_templates rt ON rt.reviewer_id=r.id
+                       WHERE r.enabled=1 AND rt.template_id=?""",
                     (template_id,),
                 ).fetchone()["count"]
-
                 if required_count > 0 and sent_count >= required_count:
                     delivered_at = utc_now().isoformat()
                     connection.execute(
                         """UPDATE reviewer_notification_queue
-                           SET status = 'delivered', delivered_at = ?, last_error = NULL,
-                               attempts = attempts + 1
-                           WHERE id = ?""",
+                           SET status='delivered', delivered_at=?, last_error=NULL, attempts=attempts+1
+                           WHERE id=?""",
                         (delivered_at, row["id"]),
                     )
-                    employee = connection.execute(
-                        "SELECT * FROM employees WHERE worker_key = ?", (row["worker_key"],)
-                    ).fetchone()
+                    employee = connection.execute("SELECT * FROM employees WHERE worker_key=?", (row["worker_key"],)).fetchone()
                     if employee:
                         _journal(
-                            connection,
-                            event_type="Уведомление контролирующему",
-                            employee=employee,
-                            template=template,
-                            status="sent",
-                            reminder_number=row["reminder_count"],
+                            connection, event_type="Уведомление контролирующему", employee=employee,
+                            template=template, status="sent", reminder_number=row["reminder_count"],
                             recipient=", ".join(r["email"] for r in reviewers),
                             details=f"Сводное письмо: {len(rows)} работников",
                         )
                 else:
                     summary["pending"] += 1
-
     return summary
 
 
@@ -304,8 +294,7 @@ def cleanup_journal(db: Database) -> int:
     with db.connect() as connection:
         retention = int(_setting(connection, "journal_retention_days", "365"))
         cutoff = (utc_now() - timedelta(days=retention)).isoformat()
-        cursor = connection.execute("DELETE FROM notification_journal WHERE created_at < ?", (cutoff,))
-        return int(cursor.rowcount)
+        return int(connection.execute("DELETE FROM notification_journal WHERE created_at < ?", (cutoff,)).rowcount)
 
 
 def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -> dict:
@@ -333,12 +322,9 @@ def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -
                     continue
 
                 initial = connection.execute(
-                    """
-                    SELECT * FROM notification_history
-                    WHERE worker_key = ? AND employment_seq = ? AND template_id = ? AND status = 'sent'
-                      AND method IN ('automatic', 'manual_seed')
-                    ORDER BY sent_at ASC LIMIT 1
-                    """,
+                    """SELECT * FROM notification_history
+                       WHERE worker_key=? AND employment_seq=? AND template_id=? AND status='sent'
+                         AND method IN ('automatic','manual_seed') ORDER BY sent_at ASC LIMIT 1""",
                     (employee["worker_key"], employee["employment_seq"], str(template["id"])),
                 ).fetchone()
                 if not initial:
@@ -346,12 +332,9 @@ def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -
                     continue
 
                 reminders = connection.execute(
-                    """
-                    SELECT * FROM notification_history
-                    WHERE worker_key = ? AND employment_seq = ? AND template_id = ? AND status = 'sent'
-                      AND method = 'reminder'
-                    ORDER BY sent_at ASC
-                    """,
+                    """SELECT * FROM notification_history
+                       WHERE worker_key=? AND employment_seq=? AND template_id=? AND status='sent'
+                         AND method='reminder' ORDER BY sent_at ASC""",
                     (employee["worker_key"], employee["employment_seq"], str(template["id"])),
                 ).fetchall()
                 reminder_count = len(reminders)
@@ -380,38 +363,39 @@ def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -
                 email_address = str(employee["email"] or "").strip()
                 if not email_address:
                     _journal(connection, event_type="Напоминание", employee=employee, template=template,
-                             status="error", reminder_number=reminder_count + 1,
+                             status="error", reminder_number=reminder_count+1,
                              details="Нет адреса электронной почты")
                     summary["errors"] += 1
                     continue
-
                 if dry_run:
                     summary["sent"] += 1
                     continue
 
                 try:
-                    subject, body, mail_enabled = _render_reminder(settings, db, template, employee, reminder_count + 1, result)
+                    subject, body, mail_enabled = _render_reminder(
+                        settings, db, connection, template, employee, reminder_count+1, result
+                    )
                     if not mail_enabled:
                         summary["skipped"] += 1
                         continue
                     send_html_email(settings.smtp, email_address, subject, body)
                     connection.execute(
-                        """INSERT INTO notification_history(worker_key, employment_seq, template_id, email, sent_at, status, method, error_text)
-                           VALUES (?, ?, ?, ?, ?, 'sent', 'reminder', NULL)""",
+                        """INSERT INTO notification_history(worker_key,employment_seq,template_id,email,sent_at,status,method,error_text)
+                           VALUES(?,?,?,?,?,'sent','reminder',NULL)""",
                         (employee["worker_key"], employee["employment_seq"], str(template["id"]), email_address, now.isoformat()),
                     )
                     _journal(connection, event_type="Напоминание", employee=employee, template=template,
-                             status="sent", reminder_number=reminder_count + 1, recipient=email_address)
+                             status="sent", reminder_number=reminder_count+1, recipient=email_address)
                     summary["sent"] += 1
                 except Exception as error:
                     error_text = str(error)
                     connection.execute(
-                        """INSERT INTO notification_history(worker_key, employment_seq, template_id, email, sent_at, status, method, error_text)
-                           VALUES (?, ?, ?, ?, ?, 'error', 'reminder', ?)""",
+                        """INSERT INTO notification_history(worker_key,employment_seq,template_id,email,sent_at,status,method,error_text)
+                           VALUES(?,?,?,?,?,'error','reminder',?)""",
                         (employee["worker_key"], employee["employment_seq"], str(template["id"]), email_address, now.isoformat(), error_text),
                     )
                     _journal(connection, event_type="Напоминание", employee=employee, template=template,
-                             status="error", reminder_number=reminder_count + 1,
+                             status="error", reminder_number=reminder_count+1,
                              recipient=email_address, details=error_text)
                     summary["errors"] += 1
                     connection.commit()

@@ -15,14 +15,24 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DEPARTMENT_SEPARATOR = " / "
 
 
+@dataclass(frozen=True)
+class EmployeePlacementRecord:
+    """Одно кадровое назначение из строки XLSX."""
+
+    department: str | None
+    position: str | None
+
+
 @dataclass
 class EmployeeRecord:
     worker_key: str
     fio: str
     email: str | None
     login: str | None
+    # Поля оставлены для обратной совместимости. Они содержат первое назначение.
     department: str | None
     position: str | None
+    placements: tuple[EmployeePlacementRecord, ...] = ()
 
 
 def normalize_header(value: Any) -> str:
@@ -61,7 +71,10 @@ def find_header_row(sheet, expected: dict[str, str], search_rows: int) -> tuple[
     best_row = None
     best_mapping: dict[str, int] = {}
     for row_idx in range(1, min(search_rows, sheet.max_row) + 1):
-        values = [normalize_header(sheet.cell(row=row_idx, column=col).value) for col in range(1, sheet.max_column + 1)]
+        values = [
+            normalize_header(sheet.cell(row=row_idx, column=col).value)
+            for col in range(1, sheet.max_column + 1)
+        ]
         mapping: dict[str, int] = {}
         for key, target in normalized_expected.items():
             for col_idx, value in enumerate(values, start=1):
@@ -123,6 +136,24 @@ def _update_department_hierarchy(
     return _department_path(hierarchy)
 
 
+def _placement_key(placement: EmployeePlacementRecord) -> tuple[str, str]:
+    return (
+        _normalize_text(placement.department).casefold(),
+        _normalize_text(placement.position).casefold(),
+    )
+
+
+def _append_placement(
+    placements: tuple[EmployeePlacementRecord, ...],
+    placement: EmployeePlacementRecord,
+) -> tuple[EmployeePlacementRecord, ...]:
+    """Добавляет назначение, удаляя только полностью одинаковую пару."""
+    key = _placement_key(placement)
+    if key in {_placement_key(item) for item in placements}:
+        return placements
+    return (*placements, placement)
+
+
 def parse_xlsx(
     path: Path,
     columns: dict[str, str],
@@ -146,7 +177,10 @@ def parse_xlsx(
     merged: dict[str, EmployeeRecord] = {}
 
     for row_idx in range(header_row + 1, sheet.max_row + 1):
-        values = [sheet.cell(row=row_idx, column=col).value for col in range(1, sheet.max_column + 1)]
+        values = [
+            sheet.cell(row=row_idx, column=col).value
+            for col in range(1, sheet.max_column + 1)
+        ]
 
         if _looks_like_department_row(values, snils_col, fio_col, email_col):
             department = next(
@@ -167,7 +201,7 @@ def parse_xlsx(
         if not snils or fio_raw is None or not str(fio_raw).strip():
             continue
 
-        fio = " ".join(str(fio_raw).split())
+        fio = _normalize_text(fio_raw)
         email = normalize_email(values[email_col - 1])
         login = None
         if email:
@@ -180,20 +214,26 @@ def parse_xlsx(
         if position_col:
             raw_position = values[position_col - 1]
             if raw_position is not None and str(raw_position).strip():
-                position = " ".join(str(raw_position).split())
+                position = _normalize_text(raw_position)
 
+        placement = EmployeePlacementRecord(
+            department=current_department,
+            position=position,
+        )
         key = worker_key(snils, hash_secret)
         existing = merged.get(key)
+
         if existing:
-            departments = [item for item in [existing.department, current_department] if item]
-            positions = [item for item in [existing.position, position] if item]
+            placements = _append_placement(existing.placements, placement)
+            primary = placements[0] if placements else placement
             merged[key] = EmployeeRecord(
                 worker_key=key,
                 fio=fio or existing.fio,
                 email=email or existing.email,
                 login=login or existing.login,
-                department=DEPARTMENT_SEPARATOR.join(dict.fromkeys(departments)) or None,
-                position=DEPARTMENT_SEPARATOR.join(dict.fromkeys(positions)) or None,
+                department=primary.department,
+                position=primary.position,
+                placements=placements,
             )
         else:
             merged[key] = EmployeeRecord(
@@ -201,8 +241,9 @@ def parse_xlsx(
                 fio=fio,
                 email=email,
                 login=login,
-                department=current_department,
-                position=position,
+                department=placement.department,
+                position=placement.position,
+                placements=(placement,),
             )
 
     workbook.close()
