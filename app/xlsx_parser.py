@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 
 SNILS_RE = re.compile(r"^\d{3}-?\d{3}-?\d{3}\s?\d{2}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+DEPARTMENT_SEPARATOR = " / "
 
 
 @dataclass
@@ -48,6 +49,12 @@ def normalize_email(value: Any) -> str | None:
     return email if EMAIL_RE.match(email) else None
 
 
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).split()).strip()
+
+
 def find_header_row(sheet, expected: dict[str, str], search_rows: int) -> tuple[int, dict[str, int]]:
     normalized_expected = {key: normalize_header(name) for key, name in expected.items()}
 
@@ -81,8 +88,39 @@ def _looks_like_department_row(values: list[Any], snils_col: int, fio_col: int, 
     if normalize_snils(snils_value) or fio_value or email_value:
         return False
 
-    nonempty = [str(v).strip() for v in values if v is not None and str(v).strip()]
+    nonempty = [_normalize_text(value) for value in values if _normalize_text(value)]
     return len(nonempty) == 1
+
+
+def _department_path(hierarchy: dict[int, str]) -> str | None:
+    """Формирует полный путь и убирает только соседние одинаковые уровни."""
+    parts: list[str] = []
+
+    for level in sorted(hierarchy):
+        department = _normalize_text(hierarchy[level])
+        if not department:
+            continue
+
+        if parts and parts[-1].casefold() == department.casefold():
+            continue
+
+        parts.append(department)
+
+    return DEPARTMENT_SEPARATOR.join(parts) or None
+
+
+def _update_department_hierarchy(
+    hierarchy: dict[int, str],
+    outline_level: int,
+    department: str,
+) -> str | None:
+    """Обновляет стек подразделений при переходе на новый уровень XLSX."""
+    for level in list(hierarchy):
+        if level >= outline_level:
+            del hierarchy[level]
+
+    hierarchy[outline_level] = department
+    return _department_path(hierarchy)
 
 
 def parse_xlsx(
@@ -103,6 +141,7 @@ def parse_xlsx(
     email_col = mapping["email"]
     position_col = mapping.get("position")
 
+    department_hierarchy: dict[int, str] = {}
     current_department: str | None = None
     merged: dict[str, EmployeeRecord] = {}
 
@@ -110,8 +149,16 @@ def parse_xlsx(
         values = [sheet.cell(row=row_idx, column=col).value for col in range(1, sheet.max_column + 1)]
 
         if _looks_like_department_row(values, snils_col, fio_col, email_col):
-            current_department = next(
-                str(v).strip() for v in values if v is not None and str(v).strip()
+            department = next(
+                _normalize_text(value)
+                for value in values
+                if _normalize_text(value)
+            )
+            outline_level = int(sheet.row_dimensions[row_idx].outlineLevel or 0)
+            current_department = _update_department_hierarchy(
+                department_hierarchy,
+                outline_level,
+                department,
             )
             continue
 
@@ -145,8 +192,8 @@ def parse_xlsx(
                 fio=fio or existing.fio,
                 email=email or existing.email,
                 login=login or existing.login,
-                department=" / ".join(dict.fromkeys(departments)) or None,
-                position=" / ".join(dict.fromkeys(positions)) or None,
+                department=DEPARTMENT_SEPARATOR.join(dict.fromkeys(departments)) or None,
+                position=DEPARTMENT_SEPARATOR.join(dict.fromkeys(positions)) or None,
             )
         else:
             merged[key] = EmployeeRecord(
@@ -158,4 +205,5 @@ def parse_xlsx(
                 position=position,
             )
 
+    workbook.close()
     return list(merged.values())

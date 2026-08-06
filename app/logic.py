@@ -49,7 +49,11 @@ def _candidate_employees(connection, template: dict):
             """,
             (template["id"],),
         ).fetchall()
-        return [employee for employee in employees if not is_employee_excluded(connection, employee, str(template["id"]))]
+        return [
+            employee
+            for employee in employees
+            if not is_employee_excluded(connection, employee, str(template["id"]))
+        ]
 
     employees = connection.execute(
         "SELECT * FROM employees WHERE active = 1 ORDER BY fio"
@@ -207,7 +211,9 @@ def fetch_and_import(settings: Settings, db: Database) -> Path:
 
     min_employees = int(source.get("min_employees", 1))
     if len(records) < min_employees:
-        raise ValueError(f"В XLSX найдено только {len(records)} сотрудников, минимум: {min_employees}")
+        raise ValueError(
+            f"В XLSX найдено только {len(records)} сотрудников, минимум: {min_employees}"
+        )
 
     with db.connect() as connection:
         previous = connection.execute(
@@ -259,7 +265,8 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
     )
 
     allowed_domains = {
-        domain.lower() for domain in settings.config.get("mail", {}).get("allowed_domains", [])
+        domain.lower()
+        for domain in settings.config.get("mail", {}).get("allowed_domains", [])
     }
     validate_domain = bool(settings.config.get("mail", {}).get("validate_domain", True))
     delay = float(settings.config.get("mail", {}).get("send_delay_seconds", 0))
@@ -378,8 +385,17 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
     return summary
 
 
-def seed_manual(settings: Settings, db: Database, template_ids: list[str], sent_date: str) -> int:
-    timestamp = datetime.fromisoformat(sent_date).replace(hour=12, minute=0, second=0).isoformat()
+def seed_manual(
+    settings: Settings,
+    db: Database,
+    template_ids: list[str],
+    sent_date: str,
+) -> int:
+    timestamp = (
+        datetime.fromisoformat(sent_date)
+        .replace(hour=12, minute=0, second=0)
+        .isoformat()
+    )
     templates_by_id = {template["id"]: template for template in settings.templates}
     unknown = set(template_ids) - set(templates_by_id)
     if unknown:
@@ -428,6 +444,7 @@ def rebuild_report(
     db: Database,
     sync_indigo: bool = True,
 ) -> Path:
+    # Параметр оставлен для совместимости с вызовами из admin_web.py.
     output = settings.reports_path / "index.html"
     build_report(
         db,
