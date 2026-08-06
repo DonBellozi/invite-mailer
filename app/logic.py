@@ -423,7 +423,11 @@ def seed_manual(settings: Settings, db: Database, template_ids: list[str], sent_
     return count
 
 
-def rebuild_report(settings: Settings, db: Database) -> Path:
+def rebuild_report(
+    settings: Settings,
+    db: Database,
+    sync_indigo: bool = True,
+) -> Path:
     output = settings.reports_path / "index.html"
     build_report(
         db,
