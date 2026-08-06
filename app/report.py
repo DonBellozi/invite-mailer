@@ -7,7 +7,7 @@ from pathlib import Path
 from .audience import is_explicit_template
 from .db import Database
 from .indigo import ResultSummary, summarize_employee_result
-from .placements import eligible_placements, is_employee_globally_excluded
+from .placements import eligible_placements, is_employee_globally_excluded, notification_availability
 
 
 CSS = """
@@ -63,6 +63,7 @@ th { position: sticky; top: 0; background: #f0f2f5; }
 .result-column-hidden { display: none; }
 .hidden { display: none !important; }
 .placement-duplicate td { border-bottom-color: #edf0f3; }
+.employee-state { margin-top: 4px; color: #667085; font-size: 12px; font-weight: 400; line-height: 1.3; }
 @media (max-width: 1240px) {
   .dashboard { flex-wrap: wrap; gap: 16px; }
   .dashboard-global, .dashboard-test { min-width: calc(50% - 8px); padding: 0; border-left: 0; }
@@ -119,6 +120,10 @@ def _mail_queue_state(connection, employee, template: dict, result: ResultSummar
     if not employee["active"] or not employee["email"]:
         return False, "", ""
     if result.status == "completed" or escalation:
+        return False, "", ""
+
+    availability = notification_availability(connection, employee, template)
+    if availability.paused:
         return False, "", ""
 
     template_id = str(template["id"])
@@ -323,7 +328,8 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path, 
                 result = summarize_employee_result(connection, employee, template)
                 escalation = connection.execute(
                     """SELECT id FROM reviewer_notification_queue
-                       WHERE worker_key=? AND employment_seq=? AND template_id=? LIMIT 1""",
+                       WHERE worker_key=? AND employment_seq=? AND template_id=?
+                         AND status != 'cancelled' LIMIT 1""",
                     (employee["worker_key"], employee["employment_seq"], template["id"]),
                 ).fetchone()
                 reminder_count = connection.execute(
@@ -332,8 +338,27 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path, 
                          AND status='sent' AND method='reminder'""",
                     (employee["worker_key"], employee["employment_seq"], template["id"]),
                 ).fetchone()["count"]
-                status, status_class, status_key = _row_status(employee, latest, result, escalation, int(reminder_count or 0))
-                queued, _, _ = _mail_queue_state(connection, employee, template, result, latest, escalation, queue_now)
+                availability = notification_availability(connection, employee, template)
+                status, status_class, status_key = _row_status(
+                    employee,
+                    latest,
+                    result,
+                    escalation,
+                    int(reminder_count or 0),
+                )
+                queued, _, _ = _mail_queue_state(
+                    connection,
+                    employee,
+                    template,
+                    result,
+                    latest,
+                    escalation,
+                    queue_now,
+                )
+                state_note = "; ".join(availability.reasons) if availability.paused and status_key != "completed" else ""
+                status_html = html.escape(status)
+                if state_note:
+                    status_html += f"<div class='employee-state'>{html.escape(state_note)}</div>"
                 if status_key == "error":
                     error_count += 1
 
@@ -358,7 +383,7 @@ def build_report(db: Database, templates: list[dict], title: str, output: Path, 
                         f"<tr{row_class} data-worker-id='{worker_id}' data-template-id='{template_id}' "
                         f"data-template-name='{template_name}' data-has-email='{has_email}' "
                         f"data-queued='{queued_value}' data-status='{escaped_status_key}'>"
-                        f"{cells}<td class='{status_class}'>{html.escape(status)}</td>"
+                        f"{cells}<td class='{status_class}'>{status_html}</td>"
                         f"<td class='result-grade-column'>{html.escape(grade)}</td>"
                         f"<td class='result-percent-column'>{html.escape(percent)}</td></tr>"
                     )

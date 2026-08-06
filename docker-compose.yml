@@ -57,7 +57,7 @@ services:
     build: .
     container_name: invite-mailer-admin
     restart: unless-stopped
-    command: ["uvicorn", "app.admin_web:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "app.admin_web_v280:app", "--host", "0.0.0.0", "--port", "8000"]
     environment: *app-environment
     volumes: *app-volumes
     networks:

@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS employee_placements (
     employment_seq INTEGER NOT NULL,
     department TEXT NOT NULL DEFAULT '',
     position TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
     sort_order INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -239,6 +240,25 @@ CREATE TABLE IF NOT EXISTS test_definitions (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS test_state_policies (
+    test_id TEXT PRIMARY KEY,
+    configured INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(test_id) REFERENCES test_definitions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS test_allowed_states (
+    test_id TEXT NOT NULL,
+    state_normalized TEXT NOT NULL,
+    state_display TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(test_id, state_normalized),
+    FOREIGN KEY(test_id) REFERENCES test_definitions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_allowed_states_test
+ON test_allowed_states(test_id, state_normalized);
+
 CREATE TABLE IF NOT EXISTS notification_journal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,
@@ -384,6 +404,12 @@ class Database:
         if "employment_started_at" not in employee_columns:
             connection.execute("ALTER TABLE employees ADD COLUMN employment_started_at TEXT")
 
+        placement_columns = self._column_names(connection, "employee_placements")
+        if "state" not in placement_columns:
+            connection.execute(
+                "ALTER TABLE employee_placements ADD COLUMN state TEXT NOT NULL DEFAULT ''"
+            )
+
         connection.execute(
             """
             UPDATE employees
@@ -397,7 +423,7 @@ class Database:
         connection.execute(
             """
             INSERT OR IGNORE INTO employee_placements(
-                worker_key, employment_seq, department, position,
+                worker_key, employment_seq, department, position, state,
                 sort_order, created_at, updated_at
             )
             SELECT
@@ -405,6 +431,7 @@ class Database:
                 e.employment_seq,
                 COALESCE(e.department, ''),
                 COALESCE(e.position, ''),
+                '',
                 0,
                 COALESCE(NULLIF(e.first_seen_at, ''), e.updated_at),
                 e.updated_at

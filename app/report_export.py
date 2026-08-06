@@ -22,7 +22,8 @@ from ttf_opensans import opensans
 from .audience import is_explicit_template
 from .db import Database
 from .indigo import summarize_employee_result
-from .placements import eligible_placements
+from .placements import eligible_placements, notification_availability
+from .report import _row_status
 
 
 FONT_REGULAR = "ReportOpenSans"
@@ -110,19 +111,39 @@ def build_test_export_report(db: Database, template: dict, created_at: datetime 
             result = summarize_employee_result(connection, employee, template)
             if result.status == "completed":
                 completed_count += 1
-                completion_date = _fmt_date(result.completed_at, include_time=False)
-                status_text = f"Пройден ({completion_date})" if completion_date else "Пройден"
-                grade = result.grade or ""
-                status_key = "completed"
             elif result.status == "failed":
                 failed_count += 1
-                status_text = "Не прошел"
-                grade = "Не прошел"
-                status_key = "failed"
-            else:
-                status_text = "Ожидает прохождения"
-                grade = ""
-                status_key = "waiting"
+
+            latest = connection.execute(
+                """SELECT * FROM notification_history
+                   WHERE worker_key = ? AND employment_seq = ? AND template_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (employee["worker_key"], employee["employment_seq"], str(template["id"])),
+            ).fetchone()
+            escalation = connection.execute(
+                """SELECT id FROM reviewer_notification_queue
+                   WHERE worker_key = ? AND employment_seq = ? AND template_id = ?
+                     AND status != 'cancelled'
+                   LIMIT 1""",
+                (employee["worker_key"], employee["employment_seq"], str(template["id"])),
+            ).fetchone()
+            reminder_count = connection.execute(
+                """SELECT COUNT(*) AS count FROM notification_history
+                   WHERE worker_key = ? AND employment_seq = ? AND template_id = ?
+                     AND status = 'sent' AND method = 'reminder'""",
+                (employee["worker_key"], employee["employment_seq"], str(template["id"])),
+            ).fetchone()["count"]
+            status_text, _, status_key = _row_status(
+                employee,
+                latest,
+                result,
+                escalation,
+                int(reminder_count or 0),
+            )
+            availability = notification_availability(connection, employee, template)
+            if availability.paused and status_key != "completed":
+                status_text += "\n" + "; ".join(availability.reasons)
+            grade = result.grade or ("Не прошел" if result.status == "failed" else "")
 
             for placement in placements:
                 export_rows.append(
@@ -216,7 +237,16 @@ def build_xlsx(report: TestExportReport) -> bytes:
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     worksheet.row_dimensions[header_row].height = 28
 
-    status_colors = {"completed": "176B36", "failed": "B42318", "waiting": "8A5B00"}
+    status_colors = {
+        "completed": "176B36",
+        "failed": "8A5B00",
+        "ignoring": "A21D1D",
+        "sent": "176B36",
+        "waiting": "8A5B00",
+        "error": "A21D1D",
+        "no_email": "A21D1D",
+        "inactive": "667085",
+    }
     first_data_row = header_row + 1
     for row_offset, item in enumerate(report.rows):
         row_number = first_data_row + row_offset
@@ -280,7 +310,16 @@ def build_pdf(report: TestExportReport) -> bytes:
     completed_style = ParagraphStyle(name="TableCompleted", parent=table_cell_style, fontName=FONT_BOLD, textColor=colors.HexColor("#176B36"))
     failed_style = ParagraphStyle(name="TableFailed", parent=table_cell_style, fontName=FONT_BOLD, textColor=colors.HexColor("#B42318"))
     waiting_style = ParagraphStyle(name="TableWaiting", parent=table_cell_style, fontName=FONT_BOLD, textColor=colors.HexColor("#8A5B00"))
-    status_styles = {"completed":completed_style,"failed":failed_style,"waiting":waiting_style}
+    status_styles = {
+        "completed": completed_style,
+        "failed": waiting_style,
+        "ignoring": failed_style,
+        "sent": completed_style,
+        "waiting": waiting_style,
+        "error": failed_style,
+        "no_email": failed_style,
+        "inactive": table_cell_style,
+    }
 
     title_text, test_text, date_text, stats_text = _metadata_lines(report)
     story = [

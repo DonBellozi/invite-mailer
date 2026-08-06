@@ -28,6 +28,7 @@ xlsx:
     fio: "Сотрудник.Физическое лицо.ФИО"
     email: "Физическое лицо.Адрес электронной почты"
     position: "Должность"
+    state: "Состояние"
 
 identity:
   login_source: "email_localpart"

@@ -21,6 +21,7 @@ class EmployeePlacementRecord:
 
     department: str | None
     position: str | None
+    state: str | None = None
 
 
 @dataclass
@@ -147,10 +148,23 @@ def _append_placement(
     placements: tuple[EmployeePlacementRecord, ...],
     placement: EmployeePlacementRecord,
 ) -> tuple[EmployeePlacementRecord, ...]:
-    """Добавляет назначение, удаляя только полностью одинаковую пару."""
+    """Добавляет назначение, удаляя только полностью одинаковую пару.
+
+    Состояние является атрибутом назначения, а не частью его идентификатора.
+    Если одна и та же пара подразделение/должность встретилась повторно,
+    сохраняется последнее непустое состояние из XLSX.
+    """
     key = _placement_key(placement)
-    if key in {_placement_key(item) for item in placements}:
-        return placements
+    for index, item in enumerate(placements):
+        if _placement_key(item) != key:
+            continue
+        state = placement.state or item.state
+        updated = EmployeePlacementRecord(
+            department=placement.department or item.department,
+            position=placement.position or item.position,
+            state=state,
+        )
+        return (*placements[:index], updated, *placements[index + 1 :])
     return (*placements, placement)
 
 
@@ -171,6 +185,7 @@ def parse_xlsx(
     fio_col = mapping["fio"]
     email_col = mapping["email"]
     position_col = mapping.get("position")
+    state_col = mapping.get("state")
 
     department_hierarchy: dict[int, str] = {}
     current_department: str | None = None
@@ -216,9 +231,16 @@ def parse_xlsx(
             if raw_position is not None and str(raw_position).strip():
                 position = _normalize_text(raw_position)
 
+        state = None
+        if state_col:
+            raw_state = values[state_col - 1]
+            if raw_state is not None and str(raw_state).strip():
+                state = _normalize_text(raw_state)
+
         placement = EmployeePlacementRecord(
             department=current_department,
             position=position,
+            state=state,
         )
         key = worker_key(snils, hash_secret)
         existing = merged.get(key)

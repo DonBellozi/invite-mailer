@@ -10,8 +10,9 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from .audience import is_explicit_template
 from .db import Database
 from .imap_source import fetch_latest_attachment
+from .indigo import summarize_employee_result
 from .mailer import send_html_email
-from .placements import eligible_placements, placement_columns
+from .placements import eligible_placements, notification_availability, placement_columns
 from .report import build_report
 from .exclusions import is_employee_excluded
 from .settings import Settings
@@ -82,6 +83,7 @@ def _record_placements(record: EmployeeRecord) -> tuple[EmployeePlacementRecord,
         EmployeePlacementRecord(
             department=record.department,
             position=record.position,
+            state=None,
         ),
     )
 
@@ -105,15 +107,16 @@ def _replace_employee_placements(
         connection.execute(
             """
             INSERT OR IGNORE INTO employee_placements(
-                worker_key, employment_seq, department, position,
+                worker_key, employment_seq, department, position, state,
                 sort_order, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.worker_key,
                 employment_seq,
                 placement.department or "",
                 placement.position or "",
+                placement.state or "",
                 sort_order,
                 timestamp,
                 timestamp,
@@ -228,9 +231,11 @@ def import_employees(db: Database, records: list[EmployeeRecord], absence_grace_
 def _parse_employee_file(settings: Settings, path: Path) -> list[EmployeeRecord]:
     source = settings.config["source"]
     xlsx_cfg = settings.config["xlsx"]
+    columns = dict(xlsx_cfg["columns"])
+    columns.setdefault("state", "Состояние")
     return parse_xlsx(
         path,
-        xlsx_cfg["columns"],
+        columns,
         int(xlsx_cfg.get("header_search_rows", 20)),
         settings.worker_hash_secret,
         settings.login_overrides,
@@ -329,7 +334,7 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
     validate_domain = bool(settings.config.get("mail", {}).get("validate_domain", True))
     delay = float(settings.config.get("mail", {}).get("send_delay_seconds", 0))
 
-    summary = {"sent": 0, "skipped": 0, "errors": 0, "dry_run": dry_run}
+    summary = {"sent": 0, "skipped": 0, "paused": 0, "errors": 0, "dry_run": dry_run}
 
     with db.connect() as connection:
         for template in settings.templates:
@@ -338,8 +343,19 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
 
             employees = _candidate_employees(connection, template)
             for employee in employees:
+                result = summarize_employee_result(connection, employee, template, now=start)
+                if result.status == "completed":
+                    summary["skipped"] += 1
+                    continue
+
                 if not _is_due(connection, employee, template, start):
                     summary["skipped"] += 1
+                    continue
+
+                availability = notification_availability(connection, employee, template)
+                if availability.paused:
+                    summary["skipped"] += 1
+                    summary["paused"] += 1
                     continue
 
                 email_address = employee["email"]
@@ -390,9 +406,8 @@ def send_notifications(settings: Settings, db: Database, dry_run: bool = False) 
                     continue
 
                 try:
-                    placements = eligible_placements(connection, employee, template)
                     department, position = placement_columns(
-                        placements,
+                        availability.active,
                         separator="; ",
                     )
                     body = environment.get_template(template["body_template"]).render(

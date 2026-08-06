@@ -8,7 +8,7 @@ from .db import Database
 from .indigo import summarize_employee_result, try_sync_indigo_results
 from .mailer import send_html_email
 from .mail_templates import ensure_mail_templates, render_mail_template
-from .placements import eligible_placements, placement_columns
+from .placements import eligible_placements, notification_availability, placement_columns
 from .settings import Settings
 from .test_catalog import load_test_definitions
 from .technical_alerts import notify_technical_error
@@ -29,9 +29,9 @@ def _template_name(template: dict) -> str:
     return str(template.get("name") or template["id"])
 
 
-def _placement_values(connection, employee, template: dict) -> tuple[str, str]:
+def _placement_values(connection, employee, template: dict, placements=None) -> tuple[str, str]:
     return placement_columns(
-        eligible_placements(connection, employee, template),
+        placements if placements is not None else eligible_placements(connection, employee, template),
         separator="; ",
     )
 
@@ -85,7 +85,16 @@ def _employees_for_template(connection, template: dict):
     return [employee for employee in employees if eligible_placements(connection, employee, template)]
 
 
-def _render_reminder(settings: Settings, db: Database, connection, template: dict, employee, reminder_number: int, result) -> tuple[str, str, bool]:
+def _render_reminder(
+    settings: Settings,
+    db: Database,
+    connection,
+    template: dict,
+    employee,
+    reminder_number: int,
+    result,
+    placements,
+) -> tuple[str, str, bool]:
     result_status = result.status or "not_started"
     test_failed = result_status == "failed"
     test_passed = result_status == "completed"
@@ -94,7 +103,7 @@ def _render_reminder(settings: Settings, db: Database, connection, template: dic
         if test_failed
         else "Тестирование еще не завершено с положительным результатом."
     )
-    department, position = _placement_values(connection, employee, template)
+    department, position = _placement_values(connection, employee, template, placements)
     context = {
         "fio": employee["fio"], "email": employee["email"], "login": employee["login"],
         "department": department, "position": position,
@@ -149,7 +158,7 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
     settings.templates[:] = load_test_definitions(settings, db)
     ensure_mail_templates(db, settings.templates)
     templates = {str(t["id"]): t for t in settings.templates}
-    summary = {"delivered": 0, "pending": 0, "errors": 0}
+    summary = {"delivered": 0, "pending": 0, "cancelled": 0, "errors": 0}
 
     with db.connect() as connection:
         params: list[object] = []
@@ -163,6 +172,33 @@ def dispatch_pending_reviewer_notifications(settings: Settings, db: Database,
             f"SELECT q.* FROM reviewer_notification_queue q {where} ORDER BY q.template_id, q.id",
             params,
         ).fetchall()
+        if not queue:
+            return summary
+
+        # Успешный результат всегда имеет высший приоритет. Если работник
+        # завершил тест до фактической отправки контролирующему, запись очереди
+        # закрывается без уведомления.
+        pending_queue = []
+        for row in queue:
+            template = templates.get(str(row["template_id"]))
+            employee = connection.execute(
+                """SELECT * FROM employees
+                   WHERE worker_key = ? AND employment_seq = ? LIMIT 1""",
+                (row["worker_key"], row["employment_seq"]),
+            ).fetchone()
+            if template and employee:
+                result = summarize_employee_result(connection, employee, template)
+                if result.status == "completed":
+                    connection.execute(
+                        """UPDATE reviewer_notification_queue
+                           SET status = 'cancelled', delivered_at = ?, last_error = NULL
+                           WHERE id = ?""",
+                        (utc_now().isoformat(), row["id"]),
+                    )
+                    summary["cancelled"] += 1
+                    continue
+            pending_queue.append(row)
+        queue = pending_queue
         if not queue:
             return summary
 
@@ -302,7 +338,7 @@ def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -
     ensure_mail_templates(db, settings.templates)
     try_sync_indigo_results(settings, db)
     now = utc_now()
-    summary = {"sent": 0, "skipped": 0, "escalated": 0, "errors": 0, "dry_run": dry_run}
+    summary = {"sent": 0, "skipped": 0, "paused": 0, "escalated": 0, "errors": 0, "dry_run": dry_run}
 
     with db.connect() as connection:
         enabled = _setting(connection, "reminders_enabled", "1") == "1"
@@ -319,6 +355,12 @@ def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -
                 result = summarize_employee_result(connection, employee, template, now=now.replace(tzinfo=None))
                 if result.status == "completed":
                     summary["skipped"] += 1
+                    continue
+
+                availability = notification_availability(connection, employee, template)
+                if availability.paused:
+                    summary["skipped"] += 1
+                    summary["paused"] += 1
                     continue
 
                 initial = connection.execute(
@@ -373,7 +415,14 @@ def process_reminders(settings: Settings, db: Database, dry_run: bool = False) -
 
                 try:
                     subject, body, mail_enabled = _render_reminder(
-                        settings, db, connection, template, employee, reminder_count+1, result
+                        settings,
+                        db,
+                        connection,
+                        template,
+                        employee,
+                        reminder_count + 1,
+                        result,
+                        availability.active,
                     )
                     if not mail_enabled:
                         summary["skipped"] += 1
